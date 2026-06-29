@@ -197,6 +197,31 @@ export default function Home() {
   const wakeFailsRef = useRef(0); // consecutive STT network failures
   const onWakeRef = useRef<() => void>(() => {});
 
+  // Chrome reliability: it pauses long/queued speech (~15s bug) and sometimes
+  // never starts a queued utterance after cancel(). A periodic resume() keeps
+  // speech flowing; the beat auto-stops once nothing is speaking or pending.
+  const ttsBeatRef = useRef<number | null>(null);
+  const startTtsBeat = useCallback(() => {
+    if (ttsBeatRef.current != null) return;
+    const synth = window.speechSynthesis;
+    if (!synth) return;
+    ttsBeatRef.current = window.setInterval(() => {
+      if (synth.speaking || synth.pending) {
+        synth.resume();
+      } else if (ttsBeatRef.current != null) {
+        clearInterval(ttsBeatRef.current);
+        ttsBeatRef.current = null;
+      }
+    }, 250);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (ttsBeatRef.current != null) clearInterval(ttsBeatRef.current);
+    },
+    [],
+  );
+
   /* ---- speak (TTS) ---- */
   const speak = useCallback((text: string, onDone?: () => void) => {
     const synth = window.speechSynthesis;
@@ -231,7 +256,8 @@ export default function Home() {
       synth.speak(u);
     });
     synth.resume(); // Chrome sometimes leaves speech paused after cancel(); unstick it
-  }, []);
+    startTtsBeat();
+  }, [startTtsBeat]);
 
   // Prime speechSynthesis inside a user gesture. Chrome only plays speech once
   // it has been invoked under a gesture in the session — after that, even
@@ -319,6 +345,7 @@ export default function Home() {
           }
           synth.speak(u);
           synth.resume(); // Chrome unstick — utterances can queue silently otherwise
+          startTtsBeat();
         };
 
         let full = "";
@@ -367,7 +394,7 @@ export default function Home() {
         setStatus("error");
       }
     },
-    [speak],
+    [speak, startTtsBeat],
   );
 
   useEffect(() => {
