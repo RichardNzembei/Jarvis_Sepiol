@@ -1,1 +1,1 @@
-[Jarvis.Sepiol](/public/jarvis.jpeg)
+![Jarvis.Sepiol](/public/jarvis.jpeg)
