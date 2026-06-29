@@ -10,9 +10,12 @@ import {
 import styles from "./page.module.css";
 import AmbientVideo from "./components/AmbientVideo";
 import CodeStream from "./components/CodeStream";
+import LockScreen from "./components/LockScreen";
 import CinematicOverlay from "./components/CinematicOverlay";
 import MediaGallery from "./components/MediaGallery";
+import Sidebar from "./components/Sidebar";
 import { sfx, unlock as unlockAudio, setMuted } from "@/lib/sound";
+import { SPRING, TAP, DUR } from "@/lib/motion";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -93,12 +96,74 @@ export default function Home() {
   const [reply, setReply] = useState("");
   const [error, setError] = useState("");
   const [typed, setTyped] = useState("");
+  const [greeting, setGreeting] = useState("");
   const [muted, setMutedState] = useState(false);
+  // null = still checking the real session; true/false = server's answer.
+  const [unlocked, setUnlocked] = useState<boolean | null>(null);
+  const [bgHidden, setBgHidden] = useState(false);
+
+  useEffect(() => {
+    const onVis = () => setBgHidden(document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/session")
+      .then((r) => r.json())
+      .then((d) => {
+        if (!cancelled) setUnlocked(!!d.authed);
+      })
+      .catch(() => {
+        if (!cancelled) setUnlocked(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleUnlock = useCallback(() => setUnlocked(true), []);
 
   useEffect(() => {
     const m = window.localStorage.getItem("jarvis-muted") === "1";
     setMuted(m);
     setMutedState(m);
+  }, []);
+
+  // Time-aware greeting for Sepiol + pick the most JARVIS-like (British) voice.
+  useEffect(() => {
+    const h = new Date().getHours();
+    const part =
+      h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
+    const g = `${part}, Sepiol. All systems are online. Hold the orb whenever you'd like to speak.`;
+    greetingRef.current = g;
+    setGreeting(g);
+
+    const synth = window.speechSynthesis;
+    if (!synth) return;
+    const pickVoice = () => {
+      const voices = synth.getVoices();
+      if (!voices.length) return;
+      const tests: Array<(v: SpeechSynthesisVoice) => boolean> = [
+        (v) => v.name === "Daniel",
+        (v) => /Google UK English Male/i.test(v.name),
+        (v) => v.lang === "en-GB" && /male|daniel|arthur|george|oliver/i.test(v.name),
+        (v) => v.lang === "en-GB",
+        (v) => v.lang.toLowerCase().startsWith("en-gb"),
+        (v) => v.lang.toLowerCase().startsWith("en"),
+      ];
+      for (const t of tests) {
+        const match = voices.find(t);
+        if (match) {
+          voiceRef.current = match;
+          return;
+        }
+      }
+    };
+    pickVoice();
+    synth.addEventListener?.("voiceschanged", pickVoice);
+    return () => synth.removeEventListener?.("voiceschanged", pickVoice);
   }, []);
 
   const toggleMute = useCallback(() => {
@@ -116,6 +181,9 @@ export default function Home() {
   const ttsUnlockedRef = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
   const sendRef = useRef<(text: string) => void>(() => {});
+  const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const greetingRef = useRef("");
+  const greetedRef = useRef(false);
 
   /* ---- speak (TTS) ---- */
   const speak = useCallback((text: string) => {
@@ -133,8 +201,9 @@ export default function Home() {
     setStatus("speaking");
     chunks.forEach((chunk, i) => {
       const u = new SpeechSynthesisUtterance(chunk);
-      u.rate = 1.02;
-      u.pitch = 1;
+      if (voiceRef.current) u.voice = voiceRef.current;
+      u.rate = 1.0;
+      u.pitch = 0.92; // a touch lower — measured, JARVIS-like
       if (i === chunks.length - 1) {
         u.onend = () => setStatus("idle");
         u.onerror = () => setStatus("idle");
@@ -168,6 +237,10 @@ export default function Home() {
           body: JSON.stringify({ messages: history }),
         });
         const data = await res.json();
+        if (res.status === 401) {
+          setUnlocked(false);
+          throw new Error("Session locked. Enter the access key again.");
+        }
         if (!res.ok) throw new Error(data?.error || "Request failed");
 
         const answer: string = data.reply || "";
@@ -263,16 +336,26 @@ export default function Home() {
     const recognition = recognitionRef.current;
     if (!recognition || listeningRef.current) return;
 
-    // Barge-in: stop any current speech and unlock audio within this gesture.
+    // Unlock audio within this gesture (browsers require it).
     unlockAudio();
-    sfx.press();
-    window.speechSynthesis?.cancel();
     if (!ttsUnlockedRef.current) {
       const warm = new SpeechSynthesisUtterance(" ");
       warm.volume = 0;
       window.speechSynthesis?.speak(warm);
       ttsUnlockedRef.current = true;
     }
+
+    // First hold wakes JARVIS: boot sound + spoken greeting, no listening yet.
+    if (!greetedRef.current) {
+      greetedRef.current = true;
+      sfx.boot();
+      speak(greetingRef.current);
+      return;
+    }
+
+    // Barge-in: stop any current speech.
+    sfx.press();
+    window.speechSynthesis?.cancel();
 
     setError("");
     setReply("");
@@ -286,7 +369,7 @@ export default function Home() {
       listeningRef.current = false;
       setStatus("idle");
     }
-  }, []);
+  }, [speak]);
 
   const stopListening = useCallback(() => {
     if (!listeningRef.current) return;
@@ -310,6 +393,34 @@ export default function Home() {
     setTyped("");
     sendMessage(text);
   };
+
+  // Right-sidebar quick actions → fire the matching tool through Jarvis.
+  const handleQuickAction = useCallback(
+    (key: "agent" | "gmail" | "github") => {
+      if (status === "thinking") return;
+      const map = {
+        agent: {
+          label: "Who are you, Jarvis?",
+          prompt: "In one or two sentences, introduce yourself and what you can do for me.",
+        },
+        gmail: {
+          label: "Check my email",
+          prompt: "Do I have any unread emails? Keep it brief.",
+        },
+        github: {
+          label: "What's on GitHub?",
+          prompt:
+            "What pull requests need my review and what issues are assigned to me? Be brief.",
+        },
+      }[key];
+      unlockAudio();
+      setError("");
+      setReply("");
+      setTranscript(map.label);
+      sendMessage(map.prompt);
+    },
+    [sendMessage, status],
+  );
 
   /* ---- render: detecting ---- */
   if (supported === null) return <main className={styles.shell} />;
@@ -339,6 +450,12 @@ export default function Home() {
     );
   }
 
+  /* ---- render: checking the session (avoids any unlocked/lock flash) ---- */
+  if (unlocked === null) return <main className={styles.shell} />;
+
+  /* ---- render: locked (auth gate) ---- */
+  if (!unlocked) return <LockScreen onUnlock={handleUnlock} />;
+
   /* ---- render: main app ---- */
   const accent = ACCENT[status];
   const showRings = status === "listening" || status === "speaking";
@@ -367,6 +484,11 @@ export default function Home() {
       <AmbientVideo />
       <CodeStream accent={accent} />
       <CinematicOverlay />
+      <Sidebar
+        accent={accent}
+        onAction={handleQuickAction}
+        disabled={status === "thinking"}
+      />
 
       <header className={styles.header}>
         <div className={styles.brand} style={{ color: accent }}>
@@ -379,7 +501,7 @@ export default function Home() {
             key={status}
             initial={{ opacity: 0, y: -4 }}
             animate={{ opacity: 1, y: 0, color: accent }}
-            transition={{ duration: 0.25 }}
+            transition={{ duration: DUR.fast }}
           >
             {STATUS_LABEL[status]}
           </motion.div>
@@ -398,7 +520,7 @@ export default function Home() {
       <section className={styles.stage}>
         <motion.div
           className={styles.pendulum}
-          animate={reduceMotion ? { rotate: 0 } : { rotate: [-6, 6] }}
+          animate={reduceMotion || bgHidden ? { rotate: 0 } : { rotate: [-6, 6] }}
           transition={
             reduceMotion
               ? undefined
@@ -427,7 +549,7 @@ export default function Home() {
                     className={styles.ring}
                     initial={{ scale: 0.62, opacity: 0.7 }}
                     animate={{ scale: 1.7, opacity: 0 }}
-                    exit={{ opacity: 0 }}
+                    exit={{ opacity: 0, transition: { duration: 0.3 } }}
                     transition={{
                       duration: 1.8,
                       repeat: Infinity,
@@ -439,14 +561,27 @@ export default function Home() {
             </AnimatePresence>
           )}
 
-          {/* thinking spinner */}
-          {status === "thinking" && (
-            <motion.div
-              className={styles.spinner}
-              animate={reduceMotion ? {} : { rotate: 360 }}
-              transition={{ duration: 1.1, repeat: Infinity, ease: "linear" }}
-            />
-          )}
+          {/* thinking spinner — eases in/out instead of snapping */}
+          <AnimatePresence>
+            {status === "thinking" && (
+              <motion.div
+                key="spinner"
+                className={styles.spinner}
+                initial={{ opacity: 0, scale: 0.8 }}
+                animate={
+                  reduceMotion
+                    ? { opacity: 1, scale: 1 }
+                    : { opacity: 1, scale: 1, rotate: 360 }
+                }
+                exit={{ opacity: 0, scale: 0.8 }}
+                transition={{
+                  opacity: { duration: 0.2 },
+                  scale: { duration: 0.2 },
+                  rotate: { duration: 1.1, repeat: Infinity, ease: "linear" },
+                }}
+              />
+            )}
+          </AnimatePresence>
 
           {/* the orb button */}
           <motion.button
@@ -460,7 +595,7 @@ export default function Home() {
             }}
             variants={orbVariants}
             animate={status}
-            whileTap={{ scale: 0.94 }}
+            whileTap={{ scale: TAP }}
             onPointerDown={(e) => {
               e.preventDefault();
               startListening();
@@ -509,6 +644,20 @@ export default function Home() {
 
       <div className={styles.feed}>
         <AnimatePresence mode="popLayout">
+          {greeting && !reply && !transcript && status !== "thinking" && (
+            <motion.div
+              key="greeting"
+              className={`${styles.bubble} ${styles.bubbleAssistant}`}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={SPRING.enter}
+            >
+              <div className={styles.bubbleLabel}>Jarvis</div>
+              <div className={styles.bubbleText}>{greeting}</div>
+            </motion.div>
+          )}
+
           {transcript && (
             <motion.div
               key="user"
@@ -516,7 +665,7 @@ export default function Home() {
               initial={{ opacity: 0, y: 10, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -8 }}
-              transition={{ type: "spring", stiffness: 320, damping: 26 }}
+              transition={SPRING.enter}
             >
               <div className={styles.bubbleLabel}>You</div>
               <div
@@ -533,17 +682,23 @@ export default function Home() {
             <motion.div
               key="thinking"
               className={`${styles.bubble} ${styles.bubbleAssistant}`}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0 }}
+              initial={{ opacity: 0, y: 10, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={SPRING.enter}
             >
               <div className={styles.bubbleLabel}>Jarvis</div>
               <span className={styles.thinkingDots} aria-label="Thinking">
-                {[0, 0.2, 0.4].map((d) => (
+                {[0, 1, 2].map((d) => (
                   <motion.span
                     key={d}
                     animate={reduceMotion ? {} : { opacity: [0.3, 1, 0.3] }}
-                    transition={{ duration: 1, repeat: Infinity, delay: d }}
+                    transition={{
+                      duration: 0.9,
+                      repeat: Infinity,
+                      delay: d * 0.18,
+                      ease: "easeInOut",
+                    }}
                   />
                 ))}
               </span>
@@ -557,7 +712,7 @@ export default function Home() {
               initial={{ opacity: 0, y: 10, scale: 0.98 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, y: -8 }}
-              transition={{ type: "spring", stiffness: 320, damping: 26 }}
+              transition={SPRING.enter}
             >
               <div className={styles.bubbleLabel}>Jarvis</div>
               <div className={styles.bubbleText}>{reply}</div>

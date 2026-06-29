@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useReducedMotion } from "framer-motion";
 
 /**
@@ -86,6 +86,14 @@ const COLS = 5;
 export default function CodeStream({ accent }: { accent: string }) {
   const reduce = useReducedMotion();
 
+  // Pause the scroll when the tab is hidden (battery — no point animating offscreen).
+  const [paused, setPaused] = useState(false);
+  useEffect(() => {
+    const onVis = () => setPaused(document.hidden);
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, []);
+
   // Build each column's doubled HTML once (rotated for variety).
   const columns = useMemo(() => {
     return Array.from({ length: COLS }, (_, i) => {
@@ -104,7 +112,7 @@ export default function CodeStream({ accent }: { accent: string }) {
         inset: 0,
         zIndex: -2,
         pointerEvents: "none",
-        opacity: 0.2,
+        opacity: 0.34,
         display: "flex",
         justifyContent: "space-around",
         gap: "3vw",
@@ -131,6 +139,7 @@ export default function CodeStream({ accent }: { accent: string }) {
                 ? "none"
                 : `codeScroll ${30 + i * 8}s linear infinite`,
               animationDelay: reduce ? undefined : `${-i * 6}s`,
+              animationPlayState: paused ? "paused" : "running",
               transform: reduce ? `translateY(${-i * 60}px)` : undefined,
               willChange: "transform",
             }}

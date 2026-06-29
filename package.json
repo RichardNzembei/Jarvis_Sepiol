@@ -10,6 +10,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.106.0",
     "framer-motion": "^12.42.0",
+    "imapflow": "^1.4.3",
     "next": "16.2.9",
     "react": "19.2.4",
     "react-dom": "19.2.4"

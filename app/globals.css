@@ -1,5 +1,3 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
-
 :root {
   /* Dark OLED palette (per design system) */
   --bg: #0f172a;
@@ -19,8 +17,8 @@
   --error: #f87171; /* red    */
 
   --radius: 16px;
-  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    Helvetica, Arial, sans-serif;
+  --font: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
 
   color-scheme: dark;
 }

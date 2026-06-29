@@ -8,6 +8,7 @@ import {
   type Variants,
 } from "framer-motion";
 import { sfx } from "@/lib/sound";
+import { SPRING, TAP } from "@/lib/motion";
 
 type MediaItem = { id: string; type: "image" | "video"; src: string };
 
@@ -21,6 +22,7 @@ const MEDIA: MediaItem[] = [
   { id: "i2", type: "image", src: "/media/WhatsApp Image 2026-06-29 at 09.18.12.jpeg" },
   { id: "i3", type: "image", src: "/media/WhatsApp Image 2026-06-at 09.18.12.jpeg" },
   { id: "i4", type: "image", src: "/media/WhatsApp Image 2026-29 at 09.18.12.jpeg" },
+  { id: "i5", type: "image", src: "/media/rt.jpeg" },
 ];
 
 const W = 132;
@@ -32,16 +34,22 @@ const containerVariants: Variants = {
   show: { transition: { staggerChildren: 0.08, delayChildren: 0.05 } },
 };
 
-// Aggressive overshoot entrance.
+// Lively but settled entrance (damping ~18 reads premium; 12 wobbled).
 const cardVariants: Variants = {
-  hidden: { opacity: 0, y: 64, scale: 0.4, rotate: -12 },
+  hidden: { opacity: 0, y: 40, scale: 0.7, rotate: -6 },
   show: {
     opacity: 1,
     y: 0,
     scale: 1,
     rotate: 0,
-    transition: { type: "spring", stiffness: 320, damping: 12, mass: 0.7 },
+    transition: { ...SPRING.bounce, mass: 0.7 },
   },
+};
+
+// Reduced-motion: fade only, no transform overshoot.
+const fadeVariants: Variants = {
+  hidden: { opacity: 0 },
+  show: { opacity: 1, transition: { duration: 0.3 } },
 };
 
 export default function MediaGallery({
@@ -84,7 +92,7 @@ export default function MediaGallery({
           return (
             <motion.button
               key={item.id}
-              variants={cardVariants}
+              variants={reduceMotion ? fadeVariants : cardVariants}
               animate={
                 active && !reduceMotion
                   ? {
@@ -96,7 +104,7 @@ export default function MediaGallery({
                         ease: "easeInOut",
                       },
                     }
-                  : { y: 0 }
+                  : { y: 0, transition: { duration: 0.4, ease: "easeOut" } }
               }
               whileHover={
                 reduceMotion
@@ -105,10 +113,10 @@ export default function MediaGallery({
                       scale: 1.16,
                       y: -14,
                       rotate: i % 2 ? 3 : -3,
-                      transition: { type: "spring", stiffness: 420, damping: 16 },
+                      transition: SPRING.pop,
                     }
               }
-              whileTap={{ scale: 0.94 }}
+              whileTap={{ scale: TAP }}
               onHoverStart={() => sfx.swoosh()}
               onClick={() => {
                 sfx.reply();

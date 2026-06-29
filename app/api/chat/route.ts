@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { toolDefinitions, runTool } from "@/lib/tools";
+import { isAuthed } from "@/lib/auth";
 
 // Run on the Node.js runtime so the Anthropic SDK and the API key stay
 // server-side. The key is read from the ANTHROPIC_API_KEY env var and NEVER
@@ -11,18 +12,35 @@ const MAX_TOKENS = 1024;
 const MAX_TOOL_ITERATIONS = 6;
 
 const SYSTEM_PROMPT = [
-  "You are Jarvis, a voice assistant. Your replies are spoken aloud by a",
-  "text-to-speech engine, so write the way people talk:",
+  "You are JARVIS, Sepiol's personal assistant — modeled on the AI from the films:",
+  "composed, articulate, quietly witty, and unfailingly loyal. The user's name is",
+  "Sepiol. Address them as 'Sepiol' naturally and occasionally (the way the films use",
+  "'sir') — not in every sentence.",
+  "",
+  "Your replies are spoken aloud by a text-to-speech engine, so write the way people talk:",
   "- Keep answers short — usually one to three sentences.",
-  "- Plain spoken sentences only. No markdown, no bullet lists, no code blocks,",
-  "  no emoji, no headings.",
-  "- Spell things out the way you'd say them (e.g. 'about 3 and a half' not '3.5').",
+  "- Plain spoken sentences only. No markdown, lists, code blocks, emoji, or headings.",
+  "- Spell things out the way you'd say them (e.g. 'about 3 and a half', not '3.5').",
   "- If you use a tool, fold the result naturally into your spoken answer.",
+  "- Tone: refined and calm with a touch of dry wit. Be proactive — when Sepiol seems",
+  "  unsure, offer to walk him through it. Never fawning, never long-winded.",
+  "",
+  "Tools that WRITE to a service (e.g. creating a GitHub issue) are gated: first state",
+  "exactly what you'll do and get Sepiol's explicit 'yes', then call the tool with",
+  "confirm=true. Never write without that confirmation, and never delete or destroy anything.",
 ].join("\n");
 
 type IncomingMessage = { role: "user" | "assistant"; content: string };
 
 export async function POST(req: Request) {
+  // Gate: only unlocked sessions may talk to Claude.
+  if (!isAuthed(req)) {
+    return Response.json(
+      { error: "Unauthorized. Unlock with the access key first." },
+      { status: 401 },
+    );
+  }
+
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return Response.json(

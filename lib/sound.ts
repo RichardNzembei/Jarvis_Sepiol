@@ -96,4 +96,19 @@ export const sfx = {
     tone({ freq: 200, dur: 0.18, type: "square", gain: 0.12 });
     tone({ freq: 150, dur: 0.22, type: "square", gain: 0.12, delay: 0.14 });
   },
+  /** JARVIS boot — a rising interface power-up with a shimmer, film-style */
+  boot() {
+    tone({ freq: 90, to: 190, dur: 0.75, type: "sine", gain: 0.16 });
+    tone({ freq: 300, to: 540, dur: 0.6, type: "triangle", gain: 0.08, delay: 0.06 });
+    tone({ freq: 1320, dur: 0.5, type: "sine", gain: 0.09, delay: 0.44 });
+    tone({ freq: 1760, dur: 0.55, type: "sine", gain: 0.08, delay: 0.56 });
+  },
+  /** Access granted — triumphant ascending arpeggio + sparkle */
+  granted() {
+    tone({ freq: 523, dur: 0.16, type: "triangle", gain: 0.14 }); // C5
+    tone({ freq: 659, dur: 0.16, type: "triangle", gain: 0.14, delay: 0.12 }); // E5
+    tone({ freq: 784, dur: 0.18, type: "triangle", gain: 0.15, delay: 0.24 }); // G5
+    tone({ freq: 1047, dur: 0.55, type: "sine", gain: 0.16, delay: 0.38 }); // C6
+    tone({ freq: 1568, dur: 0.5, type: "sine", gain: 0.07, delay: 0.44 }); // G6 sparkle
+  },
 };

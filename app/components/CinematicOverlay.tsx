@@ -35,7 +35,8 @@ export default function CinematicOverlay() {
           backgroundImage: GRAIN,
           backgroundSize: "180px 180px",
           opacity: 0.05,
-          mixBlendMode: "overlay",
+          // No mix-blend: blending over the looping video + scrolling code forced
+          // a full-viewport re-composite every frame. Plain overlay is free.
         }}
       />
     </>
