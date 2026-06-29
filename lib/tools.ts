@@ -1,4 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import { ImapFlow } from "imapflow";
 
 /**
  * Tool registry.
@@ -85,12 +86,69 @@ type FetchOpts = {
   limit: number;
 };
 
+/* ------------------------------------------------------------------ */
+/* Persistent IMAP connection.                                         */
+/* A fresh TCP+TLS+AUTH handshake to Gmail costs ~5-10s, and the old   */
+/* code paid it on EVERY email tool call. We keep one long-lived       */
+/* ImapFlow client at module scope and reuse it: warm calls skip the   */
+/* handshake entirely (seconds -> tens of ms). On Vercel/Fluid the     */
+/* singleton survives across requests in a warm instance and           */
+/* reconnects lazily after a cold start or a dropped socket.           */
+/* ------------------------------------------------------------------ */
+
+let imapClient: any = null;
+let imapConnecting: Promise<any> | null = null;
+// special-use flag (\\All, \\Sent, \\Drafts) -> mailbox path. The folder
+// layout is static per account, so resolve it once instead of LISTing per call.
+const specialUseCache = new Map<string, string>();
+
+async function getImapClient(): Promise<any> {
+  const user = process.env.EMAIL_ADDRESS;
+  const pass = process.env.GMAIL_APP_PASSWORD;
+  if (!user || !pass)
+    throw new Error("Email isn't configured (no EMAIL_ADDRESS / GMAIL_APP_PASSWORD).");
+
+  if (imapClient && imapClient.usable) return imapClient;
+  if (imapConnecting) return imapConnecting;
+
+  imapConnecting = (async () => {
+    const client = new ImapFlow({
+      host: "imap.gmail.com",
+      port: 993,
+      secure: true,
+      auth: { user, pass },
+      logger: false,
+    });
+    // Drop the cached client if the socket closes or errors, so the next
+    // call transparently reconnects.
+    const drop = () => {
+      if (imapClient === client) imapClient = null;
+    };
+    client.on("close", drop);
+    client.on("error", drop);
+    await client.connect();
+    imapClient = client;
+    return client;
+  })();
+
+  try {
+    return await imapConnecting;
+  } finally {
+    imapConnecting = null;
+  }
+}
+
 async function resolveMailbox(client: any, opts: FetchOpts): Promise<string> {
   if (opts.mailbox) return opts.mailbox;
   if (opts.special) {
+    const cached = specialUseCache.get(opts.special);
+    if (cached) return cached;
     const list = await client.list();
-    const m = list.find((x: any) => x.specialUse === opts.special);
-    if (m?.path) return m.path;
+    for (const x of list) {
+      if (x.specialUse && x.path) specialUseCache.set(x.specialUse, x.path);
+    }
+    const hit = specialUseCache.get(opts.special);
+    if (hit) return hit;
   }
   return "INBOX";
 }
@@ -99,22 +157,14 @@ async function resolveMailbox(client: any, opts: FetchOpts): Promise<string> {
 async function readMail(
   opts: FetchOpts,
 ): Promise<{ ok: boolean; error?: string; items?: MailItem[]; total?: number }> {
-  const user = process.env.EMAIL_ADDRESS;
-  const pass = process.env.GMAIL_APP_PASSWORD;
-  if (!user || !pass)
-    return { ok: false, error: "Email isn't configured (no EMAIL_ADDRESS / GMAIL_APP_PASSWORD)." };
-
-  const { ImapFlow } = await import("imapflow");
-  const client = new ImapFlow({
-    host: "imap.gmail.com",
-    port: 993,
-    secure: true,
-    auth: { user, pass },
-    logger: false,
-  });
+  let client: any;
+  try {
+    client = await getImapClient();
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 
   try {
-    await client.connect();
     const mailbox = await resolveMailbox(client, opts);
     const lock = await client.getMailboxLock(mailbox);
     const items: MailItem[] = [];
@@ -126,8 +176,10 @@ async function readMail(
       let uids: number[] | null = null;
       if (opts.query) {
         const q = opts.query;
+        // sender + subject only — fast across a large All-Mail box (full-body
+        // SEARCH was the latency culprit and rarely needed for find-by-name).
         uids = ((await client.search(
-          { or: [{ from: q }, { subject: q }, { body: q }] },
+          { or: [{ from: q }, { subject: q }] },
           { uid: true },
         )) || []) as number[];
       } else if (opts.unreadOnly) {
@@ -154,15 +206,17 @@ async function readMail(
     } finally {
       lock.release();
     }
-    await client.logout();
+    // Keep the connection open for reuse — do NOT logout on the happy path.
     items.reverse(); // newest first
     return { ok: true, items, total };
   } catch (e) {
+    // The connection may be wedged — drop it so the next call reconnects clean.
     try {
-      await client.logout();
+      if (client) await client.logout();
     } catch {
       /* ignore */
     }
+    imapClient = null;
     return { ok: false, error: `Email error: ${e instanceof Error ? e.message : String(e)}` };
   }
 }

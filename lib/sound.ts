@@ -103,6 +103,15 @@ export const sfx = {
     tone({ freq: 1320, dur: 0.5, type: "sine", gain: 0.09, delay: 0.44 });
     tone({ freq: 1760, dur: 0.55, type: "sine", gain: 0.08, delay: 0.56 });
   },
+  /** soft landing — a quiet, low muffled thud for the hopping figure */
+  land() {
+    tone({ freq: 150, to: 60, dur: 0.16, type: "sine", gain: 0.07 });
+    tone({ freq: 90, to: 48, dur: 0.12, type: "triangle", gain: 0.04, delay: 0.01 });
+  },
+  /** mid-air hop — a barely-there airy lift */
+  hop() {
+    tone({ freq: 320, to: 540, dur: 0.1, type: "sine", gain: 0.03 });
+  },
   /** Access granted — triumphant ascending arpeggio + sparkle */
   granted() {
     tone({ freq: 523, dur: 0.16, type: "triangle", gain: 0.14 }); // C5

@@ -101,6 +101,7 @@ export default function Home() {
   // null = still checking the real session; true/false = server's answer.
   const [unlocked, setUnlocked] = useState<boolean | null>(null);
   const [bgHidden, setBgHidden] = useState(false);
+  const [wakeOn, setWakeOn] = useState(false); // "hey Jarvis" listener armed?
 
   useEffect(() => {
     const onVis = () => setBgHidden(document.hidden);
@@ -185,17 +186,30 @@ export default function Home() {
   const greetingRef = useRef("");
   const greetedRef = useRef(false);
 
+  // "Hey Jarvis" wake listener — a SECOND, continuous recognizer that only
+  // runs while idle and armed. It is force-stopped whenever JARVIS is
+  // listening/thinking/speaking so it never fights the command recognizer or
+  // transcribes JARVIS's own voice.
+  const wakeRecRef = useRef<SpeechRecognitionLike | null>(null);
+  const wakeOnRef = useRef(false); // mirror of `wakeOn` for use in listeners
+  const wakeShouldRunRef = useRef(false); // is the wake recognizer supposed to be live right now?
+  const handoffRef = useRef(false); // mid wake→command handoff (suppresses re-arm)
+  const wakeFailsRef = useRef(0); // consecutive STT network failures
+  const onWakeRef = useRef<() => void>(() => {});
+
   /* ---- speak (TTS) ---- */
-  const speak = useCallback((text: string) => {
+  const speak = useCallback((text: string, onDone?: () => void) => {
     const synth = window.speechSynthesis;
     if (!synth) {
       setStatus("idle");
+      onDone?.();
       return;
     }
     synth.cancel();
     const chunks = chunkText(text);
     if (chunks.length === 0) {
       setStatus("idle");
+      onDone?.();
       return;
     }
     setStatus("speaking");
@@ -205,8 +219,14 @@ export default function Home() {
       u.rate = 1.0;
       u.pitch = 0.92; // a touch lower — measured, JARVIS-like
       if (i === chunks.length - 1) {
-        u.onend = () => setStatus("idle");
-        u.onerror = () => setStatus("idle");
+        u.onend = () => {
+          setStatus("idle");
+          onDone?.();
+        };
+        u.onerror = () => {
+          setStatus("idle");
+          onDone?.();
+        };
       }
       synth.speak(u);
     });
@@ -236,21 +256,93 @@ export default function Home() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messages: history }),
         });
-        const data = await res.json();
         if (res.status === 401) {
           setUnlocked(false);
           throw new Error("Session locked. Enter the access key again.");
         }
-        if (!res.ok) throw new Error(data?.error || "Request failed");
+        if (!res.ok) {
+          const data = await res.json().catch(() => null);
+          throw new Error(data?.error || "Request failed");
+        }
 
-        const answer: string = data.reply || "";
+        // Streamed reply: speak each sentence the moment it finishes arriving,
+        // so JARVIS starts talking before the whole answer is generated. Stay
+        // "thinking" through the silent tool-call turns; flip to "speaking" on
+        // the first spoken word; back to "idle" when the last utterance ends.
+        const synth = window.speechSynthesis;
+        synth?.cancel();
+
+        let queued = 0;
+        let ended = 0;
+        let streamDone = false;
+        let everSpoke = false;
+        const maybeIdle = () => {
+          if (streamDone && ended >= queued) setStatus("idle");
+        };
+        const speakChunk = (txt: string) => {
+          const t = txt.trim();
+          if (!synth || !t) return;
+          const u = new SpeechSynthesisUtterance(t);
+          if (voiceRef.current) u.voice = voiceRef.current;
+          u.rate = 1.0;
+          u.pitch = 0.92;
+          u.onend = () => {
+            ended++;
+            maybeIdle();
+          };
+          u.onerror = () => {
+            ended++;
+            maybeIdle();
+          };
+          queued++;
+          if (!everSpoke) {
+            everSpoke = true;
+            sfx.reply();
+            setStatus("speaking");
+          }
+          synth.speak(u);
+        };
+
+        let full = "";
+        let spoken = 0; // chars already handed to TTS
+        const drain = () => {
+          const tail = full.slice(spoken);
+          const re = /[^.!?]*[.!?]+/g; // only complete sentences
+          let consumed = 0;
+          while (re.exec(tail) !== null) consumed = re.lastIndex;
+          if (consumed > 0) {
+            speakChunk(tail.slice(0, consumed));
+            spoken += consumed;
+          }
+        };
+
+        if (res.body) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            full += decoder.decode(value, { stream: true });
+            setReply(full);
+            drain();
+          }
+          full += decoder.decode(); // flush trailing bytes
+        } else {
+          full = await res.text(); // no ReadableStream — read it whole
+        }
+
+        setReply(full);
+        const restTail = full.slice(spoken).trim();
+        if (restTail) speakChunk(restTail); // final partial sentence
+
         messagesRef.current = [
           ...history,
-          { role: "assistant", content: answer },
+          { role: "assistant", content: full },
         ];
-        setReply(answer);
-        sfx.reply();
-        speak(answer);
+
+        streamDone = true;
+        if (queued === 0) setStatus("idle");
+        else maybeIdle();
       } catch (err) {
         setError(err instanceof Error ? err.message : "Something went wrong.");
         sfx.error();
@@ -328,7 +420,77 @@ export default function Home() {
     };
 
     recognitionRef.current = recognition;
-    return () => recognition.abort();
+
+    // --- "Hey Jarvis" wake recognizer (continuous, armed on demand) ---
+    const wake = new SRClass();
+    wake.continuous = true;
+    wake.interimResults = true;
+    wake.lang = "en-US";
+
+    const matchesWake = (raw: string) => {
+      const t = raw.toLowerCase().replace(/[^a-z\s]/g, " ");
+      return (
+        /\bhey\s+jarvis\b/.test(t) ||
+        (/\bdaddy\b/.test(t) && /\bhome\b/.test(t)) ||
+        (/\bjarvis\b/.test(t) && /\bhome\b/.test(t))
+      );
+    };
+
+    wake.onresult = (e) => {
+      wakeFailsRef.current = 0; // service is reachable
+      let heard = "";
+      for (let i = 0; i < e.results.length; i++) heard += e.results[i][0].transcript + " ";
+      if (matchesWake(heard)) onWakeRef.current();
+    };
+
+    wake.onerror = (e) => {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        wakeOnRef.current = false;
+        wakeShouldRunRef.current = false;
+        setWakeOn(false);
+        setError("Microphone access denied — couldn't arm the wake word.");
+        return;
+      }
+      if (e.error === "network") {
+        wakeFailsRef.current += 1;
+        if (wakeFailsRef.current > 6) {
+          wakeOnRef.current = false;
+          wakeShouldRunRef.current = false;
+          setWakeOn(false);
+          setError(
+            "Wake word disarmed — the speech service kept failing. Chrome streams audio to Google's servers; check your connection, then re-arm.",
+          );
+        }
+      }
+      // no-speech / aborted / audio-capture: ignore — onend will restart.
+    };
+
+    wake.onend = () => {
+      // Continuous recognition still stops periodically; keep it alive while armed.
+      if (wakeShouldRunRef.current) {
+        setTimeout(() => {
+          if (wakeShouldRunRef.current) {
+            try {
+              wake.start();
+            } catch {
+              /* already running */
+            }
+          }
+        }, 350);
+      }
+    };
+
+    wakeRecRef.current = wake;
+
+    return () => {
+      recognition.abort();
+      wakeShouldRunRef.current = false;
+      try {
+        wake.abort();
+      } catch {
+        /* ignore */
+      }
+    };
   }, []);
 
   /* ---- push-to-talk controls ---- */
@@ -380,6 +542,60 @@ export default function Home() {
     window.speechSynthesis?.cancel();
     setStatus("idle");
   }, []);
+
+  /* ---- wake word: "hey Jarvis" → confirm → listen ---- */
+  const onWake = useCallback(() => {
+    if (handoffRef.current) return; // already handling a wake
+    handoffRef.current = true;
+    wakeShouldRunRef.current = false;
+    try {
+      wakeRecRef.current?.stop(); // don't transcribe our own confirmation
+    } catch {
+      /* ignore */
+    }
+    unlockAudio();
+    ttsUnlockedRef.current = true;
+    greetedRef.current = true; // skip the "first hold greets" path
+    sfx.granted();
+    setError("");
+    setReply("");
+    setTranscript("");
+    speak("Sepiol, under your command.", () => {
+      startListening(); // open the mic for the actual command
+      handoffRef.current = false;
+    });
+  }, [speak, startListening]);
+
+  useEffect(() => {
+    onWakeRef.current = onWake;
+  }, [onWake]);
+
+  const toggleWake = useCallback(() => {
+    if (!recognitionRef.current) return; // STT unsupported
+    unlockAudio(); // this click is the gesture that lets the mic + audio work
+    ttsUnlockedRef.current = true;
+    wakeFailsRef.current = 0;
+    setWakeOn((prev) => {
+      const next = !prev;
+      wakeOnRef.current = next;
+      return next;
+    });
+  }, []);
+
+  // Run the wake recognizer ONLY while armed and idle — never during a command
+  // or while JARVIS is speaking (or it would transcribe his own voice).
+  useEffect(() => {
+    const wake = wakeRecRef.current;
+    if (!wake) return;
+    const shouldRun = wakeOn && status === "idle" && !handoffRef.current;
+    wakeShouldRunRef.current = shouldRun;
+    try {
+      if (shouldRun) wake.start();
+      else wake.stop();
+    } catch {
+      /* start() throws if already running; stop() if already stopped */
+    }
+  }, [wakeOn, status]);
 
   // Typed fallback — works on any browser/network when voice STT is unavailable.
   const submitTyped = (e: React.FormEvent) => {
@@ -488,6 +704,7 @@ export default function Home() {
         accent={accent}
         onAction={handleQuickAction}
         disabled={status === "thinking"}
+        paused={bgHidden}
       />
 
       <header className={styles.header}>
@@ -505,6 +722,27 @@ export default function Home() {
           >
             {STATUS_LABEL[status]}
           </motion.div>
+          <button
+            type="button"
+            className={styles.iconBtn}
+            onClick={toggleWake}
+            aria-label={
+              wakeOn ? 'Disarm wake word' : 'Arm wake word — say "hey Jarvis"'
+            }
+            aria-pressed={wakeOn}
+            title={
+              wakeOn
+                ? 'Listening for "hey Jarvis" — click to disarm'
+                : 'Arm "hey Jarvis" wake word (mic stays on)'
+            }
+            style={
+              wakeOn
+                ? { color: accent, borderColor: accent, boxShadow: `0 0 0 1px ${accent}55` }
+                : undefined
+            }
+          >
+            <WakeIcon active={wakeOn} />
+          </button>
           <button
             type="button"
             className={styles.iconBtn}
@@ -739,6 +977,7 @@ export default function Home() {
         <MediaGallery
           accent={accent}
           active={status === "listening" || status === "speaking"}
+          paused={bgHidden}
         />
       </section>
 
@@ -832,6 +1071,36 @@ function SpeakerOffIcon() {
       <path d="M11 5 6 9H2v6h4l5 4z" />
       <line x1="16" y1="9" x2="22" y2="15" />
       <line x1="22" y1="9" x2="16" y2="15" />
+    </svg>
+  );
+}
+
+// Wake-word toggle: a "listening signal" — a centre dot with radiating arcs.
+// Filled centre when armed.
+function WakeIcon({ active }: { active?: boolean }) {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <circle
+        cx="12"
+        cy="12"
+        r={active ? 2.6 : 2}
+        fill={active ? "currentColor" : "none"}
+        stroke={active ? "none" : "currentColor"}
+      />
+      <path d="M7.8 7.8a6 6 0 0 0 0 8.4" />
+      <path d="M16.2 16.2a6 6 0 0 0 0-8.4" />
+      <path d="M5 5a10 10 0 0 0 0 14" />
+      <path d="M19 19a10 10 0 0 0 0-14" />
     </svg>
   );
 }

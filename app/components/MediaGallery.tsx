@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AnimatePresence,
   motion,
+  useAnimationControls,
   useReducedMotion,
   type Variants,
 } from "framer-motion";
@@ -28,6 +29,13 @@ const MEDIA: MediaItem[] = [
 const W = 132;
 const H = 176;
 const REFLECT_H = 52;
+
+// Route images through Next's image optimizer (resized + WebP) instead of
+// shipping the full-resolution source. A 3024×4032 / 1.2 MB photo into a 132px
+// thumb drops to ~14 KB this way. Done via the optimizer URL directly so the
+// existing layoutId shared-element morph (which lives on the <img>) is untouched.
+const opt = (src: string, w: number, q = 75) =>
+  `/_next/image?url=${encodeURIComponent(src)}&w=${w}&q=${q}`;
 
 const containerVariants: Variants = {
   hidden: {},
@@ -55,11 +63,14 @@ const fadeVariants: Variants = {
 export default function MediaGallery({
   accent,
   active,
+  paused = false,
 }: {
   accent: string;
   active: boolean; // listening / speaking → voice-reactive pulse
+  paused?: boolean; // tab hidden → stop the infinite loops entirely
 }) {
   const reduceMotion = useReducedMotion();
+  const animate = !reduceMotion && !paused;
   const [open, setOpen] = useState<number | null>(null);
 
   useEffect(() => {
@@ -73,13 +84,115 @@ export default function MediaGallery({
 
   const openItem = open === null ? null : MEDIA[open];
 
+  /* ---- hopping figure: a little silhouette that jumps card-to-card ---- */
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const frameRefs = useRef<Array<HTMLDivElement | null>>([]);
+  const posCtrl = useAnimationControls(); // wrapper x/y (the hop arc)
+  const bodyCtrl = useAnimationControls(); // inner squash/stretch
+  const [hopReady, setHopReady] = useState(false); // figure visible once placed
+  // Which card is "in focus" right now + a nonce so the same card can refocus
+  // again on a later landing (key change re-fires the animation).
+  const [focus, setFocus] = useState<{ idx: number; nonce: number }>({
+    idx: -1,
+    nonce: 0,
+  });
+
+  // Landing point for card `i`: centered horizontally, feet on its top edge,
+  // measured live so responsive flex-wrap reflows are always respected.
+  const landingFor = (i: number): { x: number; y: number } | null => {
+    const c = containerRef.current;
+    const f = frameRefs.current[i];
+    if (!c || !f) return null;
+    const cr = c.getBoundingClientRect();
+    const fr = f.getBoundingClientRect();
+    return { x: fr.left - cr.left + fr.width / 2, y: fr.top - cr.top };
+  };
+
+  const runHopper = animate && open === null;
+
+  useEffect(() => {
+    if (!runHopper) return;
+    let alive = true;
+
+    const wait = (ms: number) =>
+      new Promise<void>((r) => setTimeout(r, ms));
+
+    const loop = async () => {
+      // Let the card entrance (staggered springs) settle before measuring.
+      await wait(1100);
+      // Place the figure on the first card without an arc.
+      const start = landingFor(0);
+      if (!alive || !start) return;
+      posCtrl.set({ x: start.x, y: start.y });
+      setHopReady(true);
+
+      let i = 0;
+      let nonce = 0;
+      while (alive) {
+        const from = landingFor(i);
+        const nextIdx = (i + 1) % MEDIA.length;
+        const to = landingFor(nextIdx);
+        if (!from || !to) {
+          await wait(400);
+          continue;
+        }
+        // crouch before the leap
+        await bodyCtrl.start({
+          scaleY: 0.78,
+          scaleX: 1.12,
+          transition: { duration: 0.14, ease: "easeOut" },
+        });
+        if (!alive) return;
+        sfx.hop();
+        // the arc: x glides, y parabola up-and-over
+        const peak = Math.min(from.y, to.y) - 64;
+        await Promise.all([
+          posCtrl.start({
+            x: to.x,
+            y: [from.y, peak, to.y],
+            transition: {
+              duration: 0.62,
+              x: { ease: "easeInOut" },
+              y: { times: [0, 0.5, 1], ease: ["easeOut", "easeIn"] },
+            },
+          }),
+          bodyCtrl.start({
+            scaleY: 1.12,
+            scaleX: 0.92,
+            transition: { duration: 0.3, ease: "easeOut" },
+          }),
+        ]);
+        if (!alive) return;
+        // land: squash + soft thud + refocus the card
+        sfx.land();
+        nonce += 1;
+        setFocus({ idx: nextIdx, nonce });
+        await bodyCtrl.start({
+          scaleY: [0.7, 1],
+          scaleX: [1.18, 1],
+          transition: { duration: 0.34, ease: "easeOut" },
+        });
+        if (!alive) return;
+        i = nextIdx;
+        await wait(900); // rest on the card before the next leap
+      }
+    };
+
+    loop();
+    return () => {
+      alive = false;
+    };
+  }, [runHopper, posCtrl, bodyCtrl]);
+
   return (
     <>
       <motion.div
+        ref={containerRef}
         variants={containerVariants}
         initial="hidden"
         animate="show"
         style={{
+          position: "relative", // anchor for the absolutely-positioned hopper
           display: "flex",
           flexWrap: "wrap",
           justifyContent: "center",
@@ -87,6 +200,92 @@ export default function MediaGallery({
           padding: "4px 0",
         }}
       >
+        {/* the hopping silhouette — lands on each card in a loop */}
+        {animate && (
+          <motion.div
+            aria-hidden
+            animate={posCtrl}
+            initial={false}
+            style={{
+              position: "absolute",
+              top: 0,
+              left: 0,
+              width: 28,
+              height: 46,
+              marginLeft: -14, // center the 28px-wide figure on the landing x
+              marginTop: -46, // feet (bottom) sit on the landing y
+              zIndex: 5,
+              pointerEvents: "none",
+              opacity: hopReady ? 1 : 0,
+              filter: `drop-shadow(0 3px 4px rgba(0,0,0,0.5))`,
+            }}
+          >
+            <motion.div
+              animate={bodyCtrl}
+              style={{ width: "100%", height: "100%", transformOrigin: "50% 100%" }}
+            >
+              {/* a proper human silhouette: head, neck, torso, bent arms,
+                  striding legs — with a soft top-down gradient + sheen so it
+                  reads as a person, not a blob. */}
+              <svg width="28" height="46" viewBox="0 0 28 46" fill="none" aria-hidden>
+                <defs>
+                  <linearGradient id="figBody" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0" stopColor={accent} stopOpacity="1" />
+                    <stop offset="1" stopColor={accent} stopOpacity="0.8" />
+                  </linearGradient>
+                </defs>
+                {/* legs (slight stride + knee bend) */}
+                <path
+                  d="M12 24 L11 34 L10 43.5"
+                  stroke={accent}
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M16 24 L17 34 L18.5 43.5"
+                  stroke={accent}
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                {/* arms (elbow bend, hanging slightly out) */}
+                <path
+                  d="M10.5 14 L8 19 L7.6 24"
+                  stroke={accent}
+                  strokeWidth="3.1"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M17.5 14 L20 19 L20.4 24"
+                  stroke={accent}
+                  strokeWidth="3.1"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                {/* torso */}
+                <path
+                  d="M10 13 Q14 11 18 13 L16.8 25 Q14 26.6 11.2 25 Z"
+                  fill="url(#figBody)"
+                />
+                {/* neck */}
+                <rect x="12.6" y="9" width="2.8" height="3.6" rx="1.4" fill={accent} />
+                {/* head */}
+                <circle cx="14" cy="6" r="4.3" fill={accent} />
+                {/* sheen — cheek light + a soft edge highlight down the torso */}
+                <ellipse cx="12.4" cy="4.8" rx="1.3" ry="1.7" fill="rgba(255,255,255,0.45)" />
+                <path
+                  d="M11.5 14 L10.7 24"
+                  stroke="rgba(255,255,255,0.18)"
+                  strokeWidth="1.1"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </motion.div>
+          </motion.div>
+        )}
+
         {MEDIA.map((item, i) => {
           const hidden = open === i; // single owner of the layoutId while open
           return (
@@ -94,7 +293,7 @@ export default function MediaGallery({
               key={item.id}
               variants={reduceMotion ? fadeVariants : cardVariants}
               animate={
-                active && !reduceMotion
+                active && animate
                   ? {
                       y: [0, -10, 0],
                       transition: {
@@ -137,7 +336,16 @@ export default function MediaGallery({
               }}
             >
               {/* frame */}
-              <div
+              <motion.div
+                ref={(el) => {
+                  frameRefs.current[i] = el;
+                }}
+                animate={
+                  focus.idx === i && animate
+                    ? { scale: [1, 1.055, 1] }
+                    : { scale: 1 }
+                }
+                transition={{ duration: 0.42, ease: "easeOut" }}
                 style={{
                   position: "relative",
                   width: W,
@@ -168,10 +376,11 @@ export default function MediaGallery({
                 ) : (
                   <motion.img
                     layoutId={`media-${item.id}`}
-                    src={encodeURI(item.src)}
+                    src={opt(item.src, 384)}
                     alt=""
                     draggable={false}
                     decoding="async"
+                    loading="lazy"
                     style={{
                       width: "100%",
                       height: "100%",
@@ -212,8 +421,12 @@ export default function MediaGallery({
                   </div>
                 )}
 
-                {/* movie-like specular light sweep */}
-                {!reduceMotion && (
+                {/* movie-like specular light sweep. Plain translucent gradient,
+                    NOT mix-blend-mode: screen — blend modes force the compositor
+                    to read back + re-blend the backdrop every frame (the same
+                    lesson CinematicOverlay documents). transform-only stays on
+                    the GPU. */}
+                {animate && (
                   <motion.div
                     aria-hidden
                     initial={{ x: "-160%" }}
@@ -231,13 +444,34 @@ export default function MediaGallery({
                       bottom: 0,
                       width: "60%",
                       background:
-                        "linear-gradient(115deg, transparent 30%, rgba(255,255,255,0.35) 50%, transparent 70%)",
-                      mixBlendMode: "screen",
+                        "linear-gradient(115deg, transparent 30%, rgba(255,255,255,0.28) 50%, transparent 70%)",
                       pointerEvents: "none",
                     }}
                   />
                 )}
-              </div>
+
+                {/* camera "refocus" on landing: a blurred lens layer that fades
+                    out, snapping the photo sharp. Keyed by nonce so the same
+                    card refocuses again on each later landing. Fading the
+                    layer's opacity (compositor-friendly) reveals the sharp
+                    image behind a static backdrop-blur. */}
+                {focus.idx === i && animate && (
+                  <motion.div
+                    key={focus.nonce}
+                    aria-hidden
+                    initial={{ opacity: 1 }}
+                    animate={{ opacity: 0 }}
+                    transition={{ duration: 0.5, ease: "easeOut" }}
+                    style={{
+                      position: "absolute",
+                      inset: 0,
+                      backdropFilter: "blur(5px)",
+                      WebkitBackdropFilter: "blur(5px)",
+                      pointerEvents: "none",
+                    }}
+                  />
+                )}
+              </motion.div>
 
               {/* mirror floor reflection */}
               <div
@@ -256,9 +490,10 @@ export default function MediaGallery({
               >
                 {item.type === "image" ? (
                   <img
-                    src={encodeURI(item.src)}
+                    src={opt(item.src, 384)}
                     alt=""
                     draggable={false}
+                    loading="lazy"
                     style={{
                       width: W,
                       height: H,
@@ -325,7 +560,7 @@ export default function MediaGallery({
             ) : (
               <motion.img
                 layoutId={`media-${openItem.id}`}
-                src={encodeURI(openItem.src)}
+                src={opt(openItem.src, 1080)}
                 alt=""
                 style={{
                   maxWidth: "min(92vw, 720px)",

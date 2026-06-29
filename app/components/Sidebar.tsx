@@ -18,12 +18,15 @@ export default function Sidebar({
   accent,
   onAction,
   disabled,
+  paused = false,
 }: {
   accent: string;
   onAction: (key: ActionKey) => void;
   disabled?: boolean;
+  paused?: boolean; // tab hidden → stop infinite loops
 }) {
   const reduce = useReducedMotion();
+  const loop = !reduce && !paused;
 
   return (
     <aside
@@ -100,7 +103,7 @@ export default function Sidebar({
               }}
             />
             {/* pulsing aura */}
-            {!reduce && (
+            {loop && (
               <motion.span
                 aria-hidden
                 animate={{ scale: [1, 1.55], opacity: [0.5, 0] }}
@@ -134,7 +137,7 @@ export default function Sidebar({
               }}
             >
               <motion.span
-                animate={reduce ? {} : { y: [0, -3, 0] }}
+                animate={loop ? { y: [0, -3, 0] } : { y: 0 }}
                 transition={{
                   duration: 2.4 + i * 0.3,
                   repeat: Infinity,

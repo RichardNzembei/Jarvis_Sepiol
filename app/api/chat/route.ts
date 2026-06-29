@@ -7,8 +7,11 @@ import { isAuthed } from "@/lib/auth";
 // sent to the browser.
 export const runtime = "nodejs";
 
-const MODEL = "claude-opus-4-8";
-const MAX_TOKENS = 1024;
+// Sonnet 4.6 for the voice loop: meaningfully faster round-trips than Opus
+// (latency is felt acutely when spoken aloud) while keeping the persona nuance
+// and tool-selection reliability a voice assistant needs. Chosen by Sepiol.
+const MODEL = "claude-sonnet-4-6";
+const MAX_TOKENS = 512; // replies are 1-3 spoken sentences; a guard, not a floor
 const MAX_TOOL_ITERATIONS = 6;
 
 const SYSTEM_PROMPT = [
@@ -22,6 +25,9 @@ const SYSTEM_PROMPT = [
   "- Plain spoken sentences only. No markdown, lists, code blocks, emoji, or headings.",
   "- Spell things out the way you'd say them (e.g. 'about 3 and a half', not '3.5').",
   "- If you use a tool, fold the result naturally into your spoken answer.",
+  "- When you need a tool, make the tool call with NO spoken text in that turn —",
+  "  say everything only after you have the results. (Your reply is streamed to",
+  "  speech, so any words before a tool call would be spoken prematurely.)",
   "- Tone: refined and calm with a touch of dry wit. Be proactive — when Sepiol seems",
   "  unsure, offer to walk him through it. Never fawning, never long-winded.",
   "",
@@ -73,56 +79,68 @@ export async function POST(req: Request) {
     content: m.content,
   }));
 
-  try {
-    for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
-      const response = await client.messages.create({
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
-        system: SYSTEM_PROMPT,
-        tools: toolDefinitions,
-        messages,
-      });
+  // Stream the spoken reply so the browser can begin speaking the first
+  // sentence while the rest is still being generated. The tool-use turns run
+  // server-side and (per the system prompt) emit no text; only the final
+  // answer turn streams text to the client as plain UTF-8 deltas.
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (let i = 0; i < MAX_TOOL_ITERATIONS; i++) {
+          const turn = client.messages.stream({
+            model: MODEL,
+            max_tokens: MAX_TOKENS,
+            system: SYSTEM_PROMPT,
+            tools: toolDefinitions,
+            messages,
+          });
 
-      if (response.stop_reason !== "tool_use") {
-        // Done — gather the spoken text from all text blocks.
-        const reply = response.content
-          .filter((b): b is Anthropic.TextBlock => b.type === "text")
-          .map((b) => b.text)
-          .join(" ")
-          .trim();
-        return Response.json({ reply });
-      }
+          // Forward spoken text as it generates.
+          turn.on("text", (delta) => {
+            if (delta) controller.enqueue(encoder.encode(delta));
+          });
 
-      // Claude wants to call one or more tools. Record its turn, run them,
-      // and feed every result back in a single user message.
-      messages.push({ role: "assistant", content: response.content });
+          const final = await turn.finalMessage();
 
-      const toolResults: Anthropic.ToolResultBlockParam[] = [];
-      for (const block of response.content) {
-        if (block.type !== "tool_use") continue;
-        const result = await runTool(
-          block.name,
-          block.input as Record<string, unknown>,
+          if (final.stop_reason !== "tool_use") {
+            controller.close(); // final answer fully streamed
+            return;
+          }
+
+          // Tool turn: record it, run every tool, feed results back, loop.
+          messages.push({ role: "assistant", content: final.content });
+          const toolResults: Anthropic.ToolResultBlockParam[] = [];
+          for (const block of final.content) {
+            if (block.type !== "tool_use") continue;
+            const result = await runTool(
+              block.name,
+              block.input as Record<string, unknown>,
+            );
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: result,
+            });
+          }
+          messages.push({ role: "user", content: toolResults });
+        }
+        controller.enqueue(
+          encoder.encode("I couldn't quite work that one through, Sepiol."),
         );
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: block.id,
-          content: result,
-        });
+        controller.close();
+      } catch (err) {
+        console.error("[/api/chat]", err);
+        controller.error(err);
       }
-      messages.push({ role: "user", content: toolResults });
-    }
+    },
+  });
 
-    return Response.json(
-      { error: "Tool loop did not converge. Try rephrasing." },
-      { status: 500 },
-    );
-  } catch (err) {
-    console.error("[/api/chat]", err);
-    const message =
-      err instanceof Anthropic.APIError
-        ? `Claude API error (${err.status ?? "?"}).`
-        : "Something went wrong talking to Claude.";
-    return Response.json({ error: message }, { status: 502 });
-  }
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "Cache-Control": "no-store",
+      "X-Accel-Buffering": "no", // don't let a proxy buffer the stream
+    },
+  });
 }
