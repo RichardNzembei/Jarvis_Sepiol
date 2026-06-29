@@ -230,6 +230,23 @@ export default function Home() {
       }
       synth.speak(u);
     });
+    synth.resume(); // Chrome sometimes leaves speech paused after cancel(); unstick it
+  }, []);
+
+  // Prime speechSynthesis inside a user gesture. Chrome only plays speech once
+  // it has been invoked under a gesture in the session — after that, even
+  // delayed speak() calls (e.g. a reply that streams in 6s later) are allowed.
+  // The streamed-reply path can fire long after the click, so EVERY send
+  // gesture (type, quick-action, voice) must prime first or the reply is silent.
+  const primeTTS = useCallback(() => {
+    if (ttsUnlockedRef.current) return;
+    const synth = window.speechSynthesis;
+    if (!synth) return;
+    const warm = new SpeechSynthesisUtterance(" ");
+    warm.volume = 0;
+    synth.speak(warm);
+    synth.resume();
+    ttsUnlockedRef.current = true;
   }, []);
 
   /* ---- send to Claude ---- */
@@ -301,6 +318,7 @@ export default function Home() {
             setStatus("speaking");
           }
           synth.speak(u);
+          synth.resume(); // Chrome unstick — utterances can queue silently otherwise
         };
 
         let full = "";
@@ -500,12 +518,7 @@ export default function Home() {
 
     // Unlock audio within this gesture (browsers require it).
     unlockAudio();
-    if (!ttsUnlockedRef.current) {
-      const warm = new SpeechSynthesisUtterance(" ");
-      warm.volume = 0;
-      window.speechSynthesis?.speak(warm);
-      ttsUnlockedRef.current = true;
-    }
+    primeTTS();
 
     // First hold wakes JARVIS: boot sound + spoken greeting, no listening yet.
     if (!greetedRef.current) {
@@ -531,7 +544,7 @@ export default function Home() {
       listeningRef.current = false;
       setStatus("idle");
     }
-  }, [speak]);
+  }, [speak, primeTTS]);
 
   const stopListening = useCallback(() => {
     if (!listeningRef.current) return;
@@ -573,14 +586,14 @@ export default function Home() {
   const toggleWake = useCallback(() => {
     if (!recognitionRef.current) return; // STT unsupported
     unlockAudio(); // this click is the gesture that lets the mic + audio work
-    ttsUnlockedRef.current = true;
+    primeTTS(); // prime speech under the gesture so the wake reply can speak later
     wakeFailsRef.current = 0;
     setWakeOn((prev) => {
       const next = !prev;
       wakeOnRef.current = next;
       return next;
     });
-  }, []);
+  }, [primeTTS]);
 
   // Run the wake recognizer ONLY while armed and idle — never during a command
   // or while JARVIS is speaking (or it would transcribe his own voice).
@@ -602,7 +615,8 @@ export default function Home() {
     e.preventDefault();
     const text = typed.trim();
     if (!text || status === "thinking") return;
-    unlockAudio(); // gesture → lets the spoken reply play
+    unlockAudio(); // gesture → lets sfx play
+    primeTTS(); // gesture → lets the (later-streaming) spoken reply play
     setError("");
     setReply("");
     setTranscript(text);
@@ -630,12 +644,13 @@ export default function Home() {
         },
       }[key];
       unlockAudio();
+      primeTTS(); // gesture → lets the streamed spoken reply play
       setError("");
       setReply("");
       setTranscript(map.label);
       sendMessage(map.prompt);
     },
-    [sendMessage, status],
+    [sendMessage, status, primeTTS],
   );
 
   /* ---- render: detecting ---- */
