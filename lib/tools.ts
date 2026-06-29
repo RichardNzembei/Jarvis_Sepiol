@@ -59,23 +59,46 @@ async function ghRequest(
 /* Email helper — read-only Gmail over IMAP (App Password)             */
 /* ------------------------------------------------------------------ */
 
-type MailItem = { from: string; subject: string; date: string };
+type MailItem = { from: string; to: string; subject: string; date: string };
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function addr(arr: any[]): string {
+  return arr?.[0]?.name || arr?.[0]?.address || "";
+}
 function fmtMail(msg: any): MailItem {
   const env = msg?.envelope ?? {};
-  const fromArr = env.from ?? [];
-  const from = fromArr[0]?.name || fromArr[0]?.address || "unknown sender";
-  const date = env.date
-    ? new Date(env.date).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })
-    : "";
-  return { from, subject: env.subject || "(no subject)", date };
+  return {
+    from: addr(env.from) || "unknown sender",
+    to: addr(env.to) || "unknown recipient",
+    subject: env.subject || "(no subject)",
+    date: env.date
+      ? new Date(env.date).toLocaleString("en-US", { dateStyle: "medium", timeStyle: "short" })
+      : "",
+  };
 }
 
-async function readInbox(opts: {
-  unreadOnly: boolean;
+type FetchOpts = {
+  mailbox?: string; // literal IMAP path, e.g. "INBOX"
+  special?: "\\All" | "\\Sent" | "\\Drafts"; // resolve by special-use (locale-safe)
+  unreadOnly?: boolean;
+  query?: string; // keyword matched against From / Subject / Body
   limit: number;
-}): Promise<{ ok: boolean; error?: string; items?: MailItem[]; total?: number }> {
+};
+
+async function resolveMailbox(client: any, opts: FetchOpts): Promise<string> {
+  if (opts.mailbox) return opts.mailbox;
+  if (opts.special) {
+    const list = await client.list();
+    const m = list.find((x: any) => x.specialUse === opts.special);
+    if (m?.path) return m.path;
+  }
+  return "INBOX";
+}
+
+/** Read/search any Gmail mailbox over IMAP (read-only). */
+async function readMail(
+  opts: FetchOpts,
+): Promise<{ ok: boolean; error?: string; items?: MailItem[]; total?: number }> {
   const user = process.env.EMAIL_ADDRESS;
   const pass = process.env.GMAIL_APP_PASSWORD;
   if (!user || !pass)
@@ -92,14 +115,26 @@ async function readInbox(opts: {
 
   try {
     await client.connect();
-    const lock = await client.getMailboxLock("INBOX");
+    const mailbox = await resolveMailbox(client, opts);
+    const lock = await client.getMailboxLock(mailbox);
     const items: MailItem[] = [];
     let total = 0;
     try {
       const box = client.mailbox;
       const exists = box && typeof box !== "boolean" ? box.exists : 0;
-      if (opts.unreadOnly) {
-        const uids = ((await client.search({ seen: false }, { uid: true })) || []) as number[];
+
+      let uids: number[] | null = null;
+      if (opts.query) {
+        const q = opts.query;
+        uids = ((await client.search(
+          { or: [{ from: q }, { subject: q }, { body: q }] },
+          { uid: true },
+        )) || []) as number[];
+      } else if (opts.unreadOnly) {
+        uids = ((await client.search({ seen: false }, { uid: true })) || []) as number[];
+      }
+
+      if (uids) {
         total = uids.length;
         const take = uids.slice(-opts.limit);
         if (take.length) {
@@ -131,6 +166,7 @@ async function readInbox(opts: {
     return { ok: false, error: `Email error: ${e instanceof Error ? e.message : String(e)}` };
   }
 }
+/* eslint-enable @typescript-eslint/no-explicit-any */
 
 const tools: Tool[] = [
   {
@@ -338,7 +374,7 @@ const tools: Tool[] = [
       input_schema: { type: "object", properties: {}, required: [] },
     },
     handler: async () => {
-      const r = await readInbox({ unreadOnly: true, limit: 10 });
+      const r = await readMail({ mailbox: "INBOX", unreadOnly: true, limit: 10 });
       if (!r.ok) return r.error!;
       const items = r.items ?? [];
       if (!items.length) return "Your inbox is all caught up — no unread emails.";
@@ -362,7 +398,7 @@ const tools: Tool[] = [
       input_schema: { type: "object", properties: {}, required: [] },
     },
     handler: async () => {
-      const r = await readInbox({ unreadOnly: false, limit: 8 });
+      const r = await readMail({ mailbox: "INBOX", limit: 8 });
       if (!r.ok) return r.error!;
       const items = r.items ?? [];
       if (!items.length) return "Your inbox is empty.";
@@ -437,6 +473,83 @@ const tools: Tool[] = [
         return `WhatsApp send failed: ${data.error?.message ?? `HTTP ${res.status}`}`;
       }
       return `Message sent to ${to}.`;
+    },
+  },
+  {
+    definition: {
+      name: "search_emails",
+      description:
+        "Search the user's entire Gmail (all mail — including archived and sent) " +
+        "by a keyword matched against sender, subject, and body. Use whenever " +
+        "Sepiol asks to find a specific email or messages from/about someone " +
+        "(e.g. 'find my Netflix emails', 'anything from the bank?').",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "Keyword or name to search for, e.g. 'Netflix' or 'invoice'",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    handler: async (input) => {
+      const query = typeof input.query === "string" ? input.query.trim() : "";
+      if (!query) return "Tell me what to search for.";
+      const r = await readMail({ special: "\\All", query, limit: 12 });
+      if (!r.ok) return r.error!;
+      const items = r.items ?? [];
+      if (!items.length) return `No emails found matching "${query}".`;
+      const more =
+        (r.total ?? items.length) > items.length
+          ? ` (showing the latest ${items.length} of ${r.total})`
+          : "";
+      return (
+        `${r.total} email${r.total === 1 ? "" : "s"} matching "${query}"${more}: ` +
+        items.map((m) => `from ${m.from}, "${m.subject}" (${m.date})`).join("; ") +
+        "."
+      );
+    },
+  },
+  {
+    definition: {
+      name: "get_sent_emails",
+      description:
+        "List the user's most recently sent emails. Use when Sepiol asks what " +
+        "he sent recently or about his Sent mail.",
+      input_schema: { type: "object", properties: {}, required: [] },
+    },
+    handler: async () => {
+      const r = await readMail({ special: "\\Sent", limit: 8 });
+      if (!r.ok) return r.error!;
+      const items = r.items ?? [];
+      if (!items.length) return "No sent emails found.";
+      return (
+        `Your ${items.length} most recent sent emails: ` +
+        items.map((m) => `to ${m.to}, "${m.subject}"`).join("; ") +
+        "."
+      );
+    },
+  },
+  {
+    definition: {
+      name: "get_drafts",
+      description:
+        "List the user's saved Gmail drafts. Use when Sepiol asks about drafts " +
+        "or unfinished emails.",
+      input_schema: { type: "object", properties: {}, required: [] },
+    },
+    handler: async () => {
+      const r = await readMail({ special: "\\Drafts", limit: 8 });
+      if (!r.ok) return r.error!;
+      const items = r.items ?? [];
+      if (!items.length) return "You have no drafts.";
+      return (
+        `You have ${r.total} draft${r.total === 1 ? "" : "s"}; latest: ` +
+        items.map((m) => `to ${m.to || "no recipient"}, "${m.subject}"`).join("; ") +
+        "."
+      );
     },
   },
 ];
