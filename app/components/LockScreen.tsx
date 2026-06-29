@@ -1,13 +1,13 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion, type Variants } from "framer-motion";
 import AmbientVideo from "./AmbientVideo";
 import CodeStream from "./CodeStream";
 import CinematicOverlay from "./CinematicOverlay";
 import MediaGallery from "./MediaGallery";
 import { sfx, unlock as unlockAudio } from "@/lib/sound";
-import { speak } from "@/lib/speak";
+import { initVoice, speak } from "@/lib/speak";
 import styles from "../page.module.css";
 import { SPRING } from "@/lib/motion";
 
@@ -45,15 +45,34 @@ export default function LockScreen({ onUnlock }: { onUnlock: () => void }) {
   const [phase, setPhase] = useState<"locked" | "granted">("locked");
   const reduce = useReducedMotion();
   const welcomedRef = useRef(false);
+  const spokeRef = useRef(false);
   const finishedRef = useRef(false);
 
-  // Spoken welcome on the first interaction (TTS needs a user gesture).
+  // Try to greet the instant the site loads. Browsers usually block autoplay
+  // audio until a user gesture — if it's allowed, it speaks now; if not, the
+  // first interaction (onFirstGesture) speaks it.
+  useEffect(() => {
+    initVoice();
+    speak(
+      WELCOME_SPEECH,
+      undefined,
+      () => {
+        spokeRef.current = true;
+        welcomedRef.current = true;
+      },
+    );
+  }, []);
+
+  // Fallback: first interaction triggers the welcome (+ boot sound) if autoplay
+  // was blocked on load.
   const onFirstGesture = () => {
-    if (welcomedRef.current) return;
-    welcomedRef.current = true;
     unlockAudio();
+    if (welcomedRef.current || spokeRef.current) return;
+    welcomedRef.current = true;
     sfx.boot();
-    speak(WELCOME_SPEECH);
+    speak(WELCOME_SPEECH, undefined, () => {
+      spokeRef.current = true;
+    });
   };
 
   const finish = () => {

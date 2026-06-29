@@ -55,8 +55,12 @@ function chunk(text: string): string[] {
   return out;
 }
 
-/** Speak text; calls onEnd when the last chunk finishes (or immediately if TTS is unavailable). */
-export function speak(text: string, onEnd?: () => void) {
+/**
+ * Speak text. `onEnd` fires when the last chunk finishes (or immediately if TTS
+ * is unavailable); `onStart` fires when the first chunk actually begins playing
+ * — useful to tell whether autoplay was allowed vs. blocked until a gesture.
+ */
+export function speak(text: string, onEnd?: () => void, onStart?: () => void) {
   const synth = typeof window !== "undefined" ? window.speechSynthesis : null;
   if (!synth) {
     onEnd?.();
@@ -74,6 +78,7 @@ export function speak(text: string, onEnd?: () => void) {
     if (voice) u.voice = voice;
     u.rate = 1.0;
     u.pitch = 0.92;
+    if (i === 0 && onStart) u.onstart = () => onStart();
     if (i === parts.length - 1) {
       u.onend = () => onEnd?.();
       u.onerror = () => onEnd?.();
