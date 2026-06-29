@@ -286,6 +286,10 @@ export default function Home() {
       setError("");
       sfx.send();
       setStatus("thinking");
+      // Clear any prior/greeting speech NOW, at send time — not right before
+      // the reply speaks. cancel() immediately followed by speak() is a known
+      // Chrome bug that leaves the utterance stuck (speaking=true, no audio).
+      window.speechSynthesis?.cancel();
 
       const history: ChatMessage[] = [
         ...messagesRef.current,
@@ -312,8 +316,9 @@ export default function Home() {
         // so JARVIS starts talking before the whole answer is generated. Stay
         // "thinking" through the silent tool-call turns; flip to "speaking" on
         // the first spoken word; back to "idle" when the last utterance ends.
+        // (No cancel() here — it was moved to send-time to avoid the Chrome
+        // cancel-then-speak stall.)
         const synth = window.speechSynthesis;
-        synth?.cancel();
 
         let queued = 0;
         let ended = 0;
@@ -333,8 +338,14 @@ export default function Home() {
             ended++;
             maybeIdle();
           };
-          u.onerror = () => {
+          u.onerror = (e) => {
             ended++;
+            // Surface a real speech failure so it's visible, not silent. Ignore
+            // the benign ones (we interrupt/cancel on purpose during barge-in).
+            const err = (e as SpeechSynthesisErrorEvent).error;
+            if (err && err !== "interrupted" && err !== "canceled") {
+              setError(`Voice playback failed (${err}). Reply shown above.`);
+            }
             maybeIdle();
           };
           queued++;
@@ -342,6 +353,10 @@ export default function Home() {
             everSpoke = true;
             sfx.reply();
             setStatus("speaking");
+            // A browser with no installed voices can't speak at all — say so.
+            if (synth.getVoices().length === 0) {
+              setError("No speech voices available in this browser — reply shown above.");
+            }
           }
           synth.speak(u);
           synth.resume(); // Chrome unstick — utterances can queue silently otherwise
