@@ -102,8 +102,6 @@ export default function Home() {
   const [unlocked, setUnlocked] = useState<boolean | null>(null);
   const [bgHidden, setBgHidden] = useState(false);
   const [wakeOn, setWakeOn] = useState(false); // "hey Jarvis" listener armed?
-  const [voiceDiag, setVoiceDiag] = useState(""); // visible TTS self-test result
-  const voiceStartedRef = useRef(false);
 
   useEffect(() => {
     const onVis = () => setBgHidden(document.hidden);
@@ -639,50 +637,6 @@ export default function Home() {
     });
   }, [primeTTS]);
 
-  // Visible TTS self-test: speaks a fixed phrase from a real click gesture and
-  // reports exactly what the speech engine does, on screen — so we can see why
-  // the voice is silent without the console.
-  const testVoice = useCallback(() => {
-    const synth = window.speechSynthesis;
-    if (!synth) {
-      setVoiceDiag("✗ speechSynthesis is NOT supported in this browser.");
-      return;
-    }
-    unlockAudio();
-    const voices = synth.getVoices();
-    const local = voices.filter((v) => v.localService);
-    const v = voiceRef.current;
-    const using = v
-      ? `${v.name} (${v.localService ? "LOCAL" : "REMOTE"}, ${v.lang})`
-      : "browser default";
-    const head = `voices: ${voices.length} (local: ${local.length}) · using: ${using}`;
-    voiceStartedRef.current = false;
-    synth.cancel();
-    const u = new SpeechSynthesisUtterance("JARVIS voice test. One, two, three.");
-    if (v) u.voice = v;
-    u.rate = 1.0;
-    u.pitch = 0.92;
-    u.onstart = () => {
-      voiceStartedRef.current = true;
-      setVoiceDiag(`${head} · ▶ STARTED — you should be hearing it now`);
-    };
-    u.onend = () =>
-      setVoiceDiag(
-        `${head} · ${voiceStartedRef.current ? "✓ finished" : "✓ ended but NEVER started (silent)"}`,
-      );
-    u.onerror = (e) =>
-      setVoiceDiag(`${head} · ✗ error: ${(e as SpeechSynthesisErrorEvent).error}`);
-    setVoiceDiag(`${head} · ⏳ speaking…`);
-    synth.speak(u);
-    synth.resume();
-    startTtsBeat();
-    window.setTimeout(() => {
-      if (!voiceStartedRef.current) {
-        setVoiceDiag(`${head} · ⚠ no audio after 2s — utterance is stuck/silent`);
-      }
-    }, 2000);
-  }, [startTtsBeat]);
-
   // Run the wake recognizer ONLY while armed and idle — never during a command
   // or while JARVIS is speaking (or it would transcribe his own voice).
   useEffect(() => {
@@ -855,68 +809,8 @@ export default function Home() {
           >
             {muted ? <SpeakerOffIcon /> : <SpeakerOnIcon />}
           </button>
-          <button
-            type="button"
-            onClick={testVoice}
-            aria-label="Test the JARVIS voice"
-            title="Speak a test phrase and report what the speech engine does"
-            style={{
-              border: `1px solid ${accent}88`,
-              color: accent,
-              background: "rgba(255,255,255,0.04)",
-              borderRadius: 8,
-              padding: "6px 10px",
-              fontSize: 12,
-              fontWeight: 600,
-              letterSpacing: "0.04em",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-            }}
-          >
-            🔊 Test voice
-          </button>
         </div>
       </header>
-
-      {voiceDiag && (
-        <div
-          role="status"
-          style={{
-            position: "fixed",
-            top: 64,
-            left: "50%",
-            transform: "translateX(-50%)",
-            zIndex: 60,
-            maxWidth: "min(92vw, 680px)",
-            padding: "10px 14px",
-            borderRadius: 10,
-            background: "rgba(7,11,22,0.92)",
-            border: `1px solid ${accent}66`,
-            color: "var(--fg)",
-            fontSize: 12.5,
-            lineHeight: 1.5,
-            textAlign: "center",
-            boxShadow: "0 12px 40px -16px #000",
-          }}
-        >
-          <strong style={{ color: accent }}>Voice test:</strong> {voiceDiag}
-          <button
-            type="button"
-            onClick={() => setVoiceDiag("")}
-            aria-label="Dismiss"
-            style={{
-              marginLeft: 10,
-              background: "transparent",
-              border: "none",
-              color: "var(--fg-muted)",
-              cursor: "pointer",
-              fontSize: 13,
-            }}
-          >
-            ✕
-          </button>
-        </div>
-      )}
 
       <section className={styles.stage}>
         <motion.div
