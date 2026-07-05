@@ -1,5 +1,14 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { ImapFlow } from "imapflow";
+import {
+  spRequest,
+  spotifyConfigured,
+  authExpiryNote,
+  fmtTrack,
+  fmtMs,
+  resolveDevice,
+  deviceInventory,
+} from "@/lib/spotify";
 
 /**
  * Tool registry.
@@ -604,6 +613,230 @@ const tools: Tool[] = [
         items.map((m) => `to ${m.to || "no recipient"}, "${m.subject}"`).join("; ") +
         "."
       );
+    },
+  },
+
+  /* ---------------- Spotify — playback reads + benign controls ----------- */
+  // No confirm gate here: playback is instantly reversible. Library/playlist
+  // WRITES (phase 3) will take the gate like create_github_issue does.
+  {
+    definition: {
+      name: "get_now_playing",
+      description:
+        "Get the track currently playing on Sepiol's Spotify, including artist, " +
+        "album, progress, and which device it's on. Use when asked what's playing.",
+      input_schema: { type: "object", properties: {}, required: [] },
+    },
+    handler: async () => {
+      if (!spotifyConfigured()) return "Spotify isn't configured. Sepiol needs to set the Spotify environment variables.";
+      const r = await spRequest("/me/player");
+      if (!r.ok) return r.error;
+      if (r.data == null) {
+        return `Nothing is playing on Spotify right now. ${await deviceInventory()}` + authExpiryNote();
+      }
+      const p = r.data as {
+        is_playing?: boolean;
+        progress_ms?: number;
+        shuffle_state?: boolean;
+        device?: { name?: string };
+        item?: Parameters<typeof fmtTrack>[0];
+      };
+      if (!p.item) return "Spotify is active but didn't report a track (possibly an ad break)." + authExpiryNote();
+      return (
+        `${p.is_playing ? "Playing" : "Paused"}: ${fmtTrack(p.item)} — ` +
+        `${fmtMs(p.progress_ms)} into ${fmtMs(p.item.duration_ms)}` +
+        (p.device?.name ? `, on "${p.device.name}"` : "") +
+        `. Shuffle: ${p.shuffle_state ? "on" : "off"}.` +
+        authExpiryNote()
+      );
+    },
+  },
+  {
+    definition: {
+      name: "control_playback",
+      description:
+        "Control Spotify playback: resume (play), pause, skip to the next or " +
+        "previous track, or set volume. Acts on the active device unless a " +
+        "device name is given.",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["play", "pause", "next", "previous", "volume"],
+            description: "What to do. 'play' resumes paused playback.",
+          },
+          volume_percent: {
+            type: "number",
+            description: "0-100. Required when action is 'volume'.",
+          },
+          device: {
+            type: "string",
+            description: "Optional device name (or part of one) to act on.",
+          },
+        },
+        required: ["action"],
+      },
+    },
+    handler: async (input) => {
+      if (!spotifyConfigured()) return "Spotify isn't configured. Sepiol needs to set the Spotify environment variables.";
+      const action = String(input.action ?? "");
+      const dev = await resolveDevice(typeof input.device === "string" ? input.device : undefined);
+      if ("fail" in dev) return dev.fail;
+      const q = dev.id ? `?device_id=${encodeURIComponent(dev.id)}` : "";
+
+      let r;
+      if (action === "play") r = await spRequest(`/me/player/play${q}`, { method: "PUT" });
+      else if (action === "pause") r = await spRequest(`/me/player/pause${q}`, { method: "PUT" });
+      else if (action === "next") r = await spRequest(`/me/player/next${q}`, { method: "POST" });
+      else if (action === "previous") r = await spRequest(`/me/player/previous${q}`, { method: "POST" });
+      else if (action === "volume") {
+        const v = Math.max(0, Math.min(100, Math.round(Number(input.volume_percent))));
+        if (Number.isNaN(v)) return "A volume_percent between 0 and 100 is required to set volume.";
+        r = await spRequest(`/me/player/volume?volume_percent=${v}${q ? `&${q.slice(1)}` : ""}`, { method: "PUT" });
+        if (r.ok) return `Volume set to ${v} percent.` + authExpiryNote();
+      } else return `Unknown action "${action}".`;
+
+      if (!r.ok) {
+        if (r.error === "NO_ACTIVE_DEVICE") return `No active Spotify device. ${await deviceInventory()}`;
+        if (r.status === 403) return `Spotify refused: playback is likely already ${action === "pause" ? "paused" : "in that state"}.`;
+        return r.error;
+      }
+      const said: Record<string, string> = {
+        play: "Playback resumed.",
+        pause: "Paused.",
+        next: "Skipped to the next track.",
+        previous: "Went back to the previous track.",
+      };
+      return (said[action] ?? "Done.") + authExpiryNote();
+    },
+  },
+  {
+    definition: {
+      name: "search_music",
+      description:
+        "Search Spotify for tracks, albums, artists, or playlists. Returns up " +
+        "to three matches, each with a URI for play_music or queue_track. " +
+        "Never speak URIs or IDs aloud — refer to results by name.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to search for." },
+          kind: {
+            type: "string",
+            enum: ["track", "album", "artist", "playlist"],
+            description: "Result type. Default: track.",
+          },
+        },
+        required: ["query"],
+      },
+    },
+    handler: async (input) => {
+      if (!spotifyConfigured()) return "Spotify isn't configured. Sepiol needs to set the Spotify environment variables.";
+      const query = String(input.query ?? "").trim();
+      if (!query) return "A search query is required.";
+      const kind = typeof input.kind === "string" ? input.kind : "track";
+      const r = await spRequest(`/search?${new URLSearchParams({ q: query, type: kind, limit: "3" })}`);
+      if (!r.ok) return r.error;
+      const bucket = (r.data as Record<string, { items?: Array<{ name?: string; uri?: string; artists?: { name: string }[]; album?: { name: string } }> }>)?.[`${kind}s`];
+      const items = (bucket?.items ?? []).filter(Boolean);
+      if (!items.length) return `No ${kind} results for "${query}".`;
+      return (
+        `Top ${kind} matches for "${query}": ` +
+        items.map((it, i) => `${i + 1}. ${fmtTrack(it)} [uri: ${it.uri}]`).join("; ") +
+        "."
+      );
+    },
+  },
+  {
+    definition: {
+      name: "play_music",
+      description:
+        "Start playing a specific track, album, artist, or playlist on Sepiol's " +
+        "Spotify. Pass a uri from search_music, or just a query to play the top " +
+        "match directly. Needs an active or named device. Distinct from " +
+        "control_playback's 'play', which only resumes.",
+      input_schema: {
+        type: "object",
+        properties: {
+          uri: { type: "string", description: "Spotify URI from search_music." },
+          query: { type: "string", description: "Free-text search; the top match plays." },
+          kind: {
+            type: "string",
+            enum: ["track", "album", "artist", "playlist"],
+            description: "Type for query resolution. Default: track.",
+          },
+          device: { type: "string", description: "Optional device name to play on." },
+        },
+        required: [],
+      },
+    },
+    handler: async (input) => {
+      if (!spotifyConfigured()) return "Spotify isn't configured. Sepiol needs to set the Spotify environment variables.";
+      const kind = typeof input.kind === "string" ? input.kind : "track";
+      let uri = typeof input.uri === "string" ? input.uri.trim() : "";
+      let label = "";
+      if (!uri) {
+        const query = typeof input.query === "string" ? input.query.trim() : "";
+        if (!query) return "Either a uri or a query is required.";
+        const s = await spRequest(`/search?${new URLSearchParams({ q: query, type: kind, limit: "1" })}`);
+        if (!s.ok) return s.error;
+        const item = (s.data as Record<string, { items?: Array<{ uri?: string } & Parameters<typeof fmtTrack>[0]> }>)?.[`${kind}s`]?.items?.[0];
+        if (!item?.uri) return `Nothing found on Spotify for "${query}".`;
+        uri = item.uri;
+        label = fmtTrack(item);
+      }
+      const dev = await resolveDevice(typeof input.device === "string" ? input.device : undefined);
+      if ("fail" in dev) return dev.fail;
+      const q = dev.id ? `?device_id=${encodeURIComponent(dev.id)}` : "";
+      const body = uri.includes(":track:") ? { uris: [uri] } : { context_uri: uri };
+      const r = await spRequest(`/me/player/play${q}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        if (r.error === "NO_ACTIVE_DEVICE") return `No active Spotify device. ${await deviceInventory()}`;
+        return r.error;
+      }
+      return `Now playing ${label || "the requested music"}.` + authExpiryNote();
+    },
+  },
+  {
+    definition: {
+      name: "queue_track",
+      description:
+        "Add a track to the end of the current Spotify queue. Pass a uri from " +
+        "search_music, or a query to queue the top matching track.",
+      input_schema: {
+        type: "object",
+        properties: {
+          uri: { type: "string", description: "Spotify track URI." },
+          query: { type: "string", description: "Free-text search; queues the top track match." },
+        },
+        required: [],
+      },
+    },
+    handler: async (input) => {
+      if (!spotifyConfigured()) return "Spotify isn't configured. Sepiol needs to set the Spotify environment variables.";
+      let uri = typeof input.uri === "string" ? input.uri.trim() : "";
+      let label = "";
+      if (!uri) {
+        const query = typeof input.query === "string" ? input.query.trim() : "";
+        if (!query) return "Either a uri or a query is required.";
+        const s = await spRequest(`/search?${new URLSearchParams({ q: query, type: "track", limit: "1" })}`);
+        if (!s.ok) return s.error;
+        const item = (s.data as { tracks?: { items?: Array<{ uri?: string } & Parameters<typeof fmtTrack>[0]> } })?.tracks?.items?.[0];
+        if (!item?.uri) return `No track found for "${query}".`;
+        uri = item.uri;
+        label = fmtTrack(item);
+      }
+      const r = await spRequest(`/me/player/queue?uri=${encodeURIComponent(uri)}`, { method: "POST" });
+      if (!r.ok) {
+        if (r.error === "NO_ACTIVE_DEVICE") return `No active Spotify device. ${await deviceInventory()}`;
+        return r.error;
+      }
+      return `Queued ${label || "the track"}.` + authExpiryNote();
     },
   },
 ];
