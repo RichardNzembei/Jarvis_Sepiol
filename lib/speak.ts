@@ -12,21 +12,21 @@ function pick() {
   if (!synth) return;
   const voices = synth.getVoices();
   if (!voices.length) return;
-  const tests: Array<(v: SpeechSynthesisVoice) => boolean> = [
-    (v) => v.name === "Daniel",
-    (v) => /Google UK English Male/i.test(v.name),
-    (v) => v.lang === "en-GB" && /male|daniel|arthur|george|oliver/i.test(v.name),
-    (v) => v.lang === "en-GB",
-    (v) => v.lang.toLowerCase().startsWith("en-gb"),
-    (v) => v.lang.toLowerCase().startsWith("en"),
-  ];
-  for (const t of tests) {
-    const match = voices.find(t);
-    if (match) {
-      voice = match;
-      return;
-    }
-  }
+  const en = voices.filter((v) => v.lang.toLowerCase().startsWith("en"));
+  const pool = en.length ? en : voices;
+  // Score: LOCAL voices first — Chrome's remote "Google" voices play over the
+  // network and fail SILENTLY (audio just never comes out) while local OS
+  // voices are reliable. Then prefer a British male timbre for JARVIS.
+  const score = (v: SpeechSynthesisVoice) => {
+    let s = 0;
+    if (v.localService) s += 100;
+    if (/^en-GB/i.test(v.lang)) s += 40;
+    if (v.name === "Daniel") s += 30;
+    if (/daniel|arthur|george|oliver|male/i.test(v.name)) s += 12;
+    return s;
+  };
+  const best = [...pool].sort((a, b) => score(b) - score(a))[0];
+  if (best) voice = best;
 }
 
 export function initVoice() {
@@ -67,7 +67,11 @@ export function speak(text: string, onEnd?: () => void, onStart?: () => void) {
     return;
   }
   initVoice();
-  synth.cancel();
+  // Cancel ONLY when something is actually speaking or queued. A bare
+  // cancel() on an idle engine wedges Chrome's speech synthesis on macOS:
+  // later utterances set speaking=true but never fire onstart and produce
+  // no audio for the rest of the session.
+  if (synth.speaking || synth.pending) synth.cancel();
   const parts = chunk(text);
   if (!parts.length) {
     onEnd?.();
