@@ -14,6 +14,30 @@ const MODEL = "claude-sonnet-4-6";
 const MAX_TOKENS = 512; // replies are 1-3 spoken sentences; a guard, not a floor
 const MAX_TOOL_ITERATIONS = 6;
 
+// Short phrases streamed (and therefore spoken) while a slow tool runs, so the
+// orb doesn't sit in silent "thinking" through a multi-second IMAP/GitHub call.
+// Sentence-final punctuation matters: the client only speaks complete sentences.
+const NARRATION: Record<string, string> = {
+  get_current_time: "",
+  get_review_requests: "Checking your review queue. ",
+  list_repositories: "Looking over your repositories. ",
+  list_my_issues: "Pulling up your open issues. ",
+  list_github_notifications: "Checking your GitHub notifications. ",
+  create_github_issue: "Filing that issue now. ",
+  get_unread_emails: "Checking your inbox now. ",
+  get_recent_emails: "Going through your recent mail. ",
+  send_whatsapp: "Sending that message. ",
+  search_emails: "Searching your mail. ",
+  get_sent_emails: "Checking your sent mail. ",
+  get_drafts: "Opening your drafts. ",
+  web_search: "Searching the web. ",
+  get_now_playing: "Checking what's playing. ",
+  control_playback: "", // sub-second action — narration would outlast it
+  search_music: "Searching Spotify. ",
+  play_music: "Starting the music. ",
+  queue_track: "Queuing that up. ",
+};
+
 const SYSTEM_PROMPT = [
   "You are JARVIS, Sepiol's personal assistant — modeled on the AI from the films:",
   "composed, articulate, quietly witty, and unfailingly loyal. The user's name is",
@@ -34,6 +58,14 @@ const SYSTEM_PROMPT = [
   "Tools that WRITE to a service (e.g. creating a GitHub issue) are gated: first state",
   "exactly what you'll do and get Sepiol's explicit 'yes', then call the tool with",
   "confirm=true. Never write without that confirmation, and never delete or destroy anything.",
+  "",
+  "You can search the web for current information — news, weather, anything after your",
+  "training data. Compress what you find into one to three spoken sentences; never read",
+  "out URLs, source names, or lists of results.",
+  "",
+  "You can control Sepiol's Spotify: check what's playing, play, pause, skip, set",
+  "volume, search, and queue music. Refer to music by name — never read URIs or IDs",
+  "aloud. If no device is active, say which devices are available and ask where to play.",
 ].join("\n");
 
 type IncomingMessage = { role: "user" | "assistant"; content: string };
@@ -73,11 +105,29 @@ export async function POST(req: Request) {
   const client = new Anthropic({ apiKey });
 
   // Build the working conversation. We append assistant turns and tool results
-  // as the agentic loop runs.
-  const messages: Anthropic.MessageParam[] = incoming.map((m) => ({
+  // as the agentic loop runs. The last incoming message carries a cache
+  // breakpoint so the whole prior conversation is a stable, reusable prefix
+  // across turns and across the tool-loop iterations below.
+  const messages: Anthropic.MessageParam[] = incoming.map((m, idx) => ({
     role: m.role,
-    content: m.content,
+    content:
+      idx === incoming.length - 1
+        ? [
+            {
+              type: "text" as const,
+              text: m.content,
+              cache_control: { type: "ephemeral" as const },
+            },
+          ]
+        : m.content,
   }));
+
+  // Client tools (executed here via runTool) + Anthropic's server-side web
+  // search, which runs on their end mid-turn and needs no handler.
+  const tools: Anthropic.ToolUnion[] = [
+    ...toolDefinitions,
+    { type: "web_search_20260209", name: "web_search", max_uses: 3 },
+  ];
 
   // Stream the spoken reply so the browser can begin speaking the first
   // sentence while the rest is still being generated. The tool-use turns run
@@ -91,8 +141,16 @@ export async function POST(req: Request) {
           const turn = client.messages.stream({
             model: MODEL,
             max_tokens: MAX_TOKENS,
-            system: SYSTEM_PROMPT,
-            tools: toolDefinitions,
+            // Block form so the system prompt takes a cache breakpoint: tools +
+            // system render before messages, so this one marker caches both.
+            system: [
+              {
+                type: "text",
+                text: SYSTEM_PROMPT,
+                cache_control: { type: "ephemeral" },
+              },
+            ],
+            tools,
             messages,
           });
 
@@ -102,6 +160,21 @@ export async function POST(req: Request) {
           });
 
           const final = await turn.finalMessage();
+
+          // Token/cache telemetry only — never message content.
+          console.log("[/api/chat]", {
+            stop: final.stop_reason,
+            input: final.usage.input_tokens,
+            cacheRead: final.usage.cache_read_input_tokens,
+            cacheWrite: final.usage.cache_creation_input_tokens,
+          });
+
+          // Server-side tools (web search) can pause a long turn; hand the
+          // partial turn back and continue where it left off.
+          if (final.stop_reason === "pause_turn") {
+            messages.push({ role: "assistant", content: final.content });
+            continue;
+          }
 
           if (final.stop_reason !== "tool_use") {
             controller.close(); // final answer fully streamed
@@ -113,6 +186,10 @@ export async function POST(req: Request) {
           const toolResults: Anthropic.ToolResultBlockParam[] = [];
           for (const block of final.content) {
             if (block.type !== "tool_use") continue;
+            // Narrate the slow part: stream a short phrase the client speaks
+            // while the tool actually runs.
+            const phrase = NARRATION[block.name];
+            if (phrase) controller.enqueue(encoder.encode(phrase));
             const result = await runTool(
               block.name,
               block.input as Record<string, unknown>,
