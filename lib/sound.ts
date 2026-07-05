@@ -72,36 +72,54 @@ function tone({ freq, to, dur, type = "sine", gain = 0.18, delay = 0 }: Tone) {
   osc.stop(t0 + dur + 0.02);
 }
 
+/**
+ * The JARVIS leitmotif — C5·E5·G5, the same triad `granted` has always played.
+ * Every "voice of the interface" sound below is a variation of it (a fragment,
+ * a compression, a stretch, a minor inversion), so the whole app rhymes. Kept
+ * at existing gain levels: leitmotifs work subconsciously — the moment you
+ * notice the system, it's too loud. Physical foley (swoosh/land/hop) stays
+ * non-motif on purpose: those are objects in the room, not Jarvis speaking.
+ */
+const THEME = [523.25, 659.25, 783.99] as const; // C5, E5, G5
+const THEME_MINOR_DOWN = [261.63, 207.65, 174.61] as const; // C4, Ab3, F3 — inverted, fallen
+
+/** Play a note sequence as one gesture. */
+function motif(
+  notes: readonly number[],
+  opts: { step?: number; dur?: number; type?: OscillatorType; gain?: number; delay?: number } = {},
+) {
+  const { step = 0.06, dur = 0.18, type = "triangle", gain = 0.15, delay = 0 } = opts;
+  notes.forEach((freq, i) => tone({ freq, dur, type, gain, delay: delay + i * step }));
+}
+
 /** Sound effects, mapped to assistant states + UI interactions. */
 export const sfx = {
-  /** start listening — bright rising blip */
+  /** start listening — the motif's first interval, rising (C5 → E5) */
   press() {
-    tone({ freq: 420, to: 760, dur: 0.16, type: "triangle", gain: 0.2 });
+    tone({ freq: THEME[0], to: THEME[1], dur: 0.16, type: "triangle", gain: 0.2 });
   },
-  /** release / send — quick descending whoosh */
+  /** release / send — the motif's top note falling home an octave (G5 → C4) */
   send() {
-    tone({ freq: 700, to: 220, dur: 0.22, type: "sawtooth", gain: 0.14 });
+    tone({ freq: THEME[2], to: THEME[0] / 2, dur: 0.22, type: "sawtooth", gain: 0.14 });
   },
-  /** reply arrived — two-note confirming chime */
+  /** reply arrived — the full motif compressed to ~180ms */
   reply() {
-    tone({ freq: 660, dur: 0.16, type: "sine", gain: 0.16 });
-    tone({ freq: 990, dur: 0.26, type: "sine", gain: 0.16, delay: 0.1 });
+    motif(THEME, { step: 0.06, dur: 0.2, type: "sine", gain: 0.15 });
   },
-  /** media interaction — short airy swoosh */
+  /** media interaction — short airy swoosh (foley, non-motif) */
   swoosh() {
     tone({ freq: 1200, to: 480, dur: 0.18, type: "triangle", gain: 0.1 });
   },
-  /** error — low double buzz */
+  /** error — the motif inverted into minor and dropped low, falling away */
   error() {
-    tone({ freq: 200, dur: 0.18, type: "square", gain: 0.12 });
-    tone({ freq: 150, dur: 0.22, type: "square", gain: 0.12, delay: 0.14 });
+    motif(THEME_MINOR_DOWN, { step: 0.11, dur: 0.2, type: "square", gain: 0.11 });
   },
-  /** JARVIS boot — a rising interface power-up with a shimmer, film-style */
+  /** JARVIS boot — power-up sweep, then the motif stretched out as the shimmer */
   boot() {
     tone({ freq: 90, to: 190, dur: 0.75, type: "sine", gain: 0.16 });
     tone({ freq: 300, to: 540, dur: 0.6, type: "triangle", gain: 0.08, delay: 0.06 });
-    tone({ freq: 1320, dur: 0.5, type: "sine", gain: 0.09, delay: 0.44 });
-    tone({ freq: 1760, dur: 0.55, type: "sine", gain: 0.08, delay: 0.56 });
+    motif(THEME, { step: 0.14, dur: 0.4, type: "sine", gain: 0.08, delay: 0.32 });
+    tone({ freq: THEME[0] * 2, dur: 0.5, type: "sine", gain: 0.07, delay: 0.74 }); // C6 crown
   },
   /** soft landing — a quiet, low muffled thud for the hopping figure */
   land() {
@@ -112,12 +130,10 @@ export const sfx = {
   hop() {
     tone({ freq: 320, to: 540, dur: 0.1, type: "sine", gain: 0.03 });
   },
-  /** Access granted — triumphant ascending arpeggio + sparkle */
+  /** Access granted — the motif in full ceremony: triad, octave crown, sparkle */
   granted() {
-    tone({ freq: 523, dur: 0.16, type: "triangle", gain: 0.14 }); // C5
-    tone({ freq: 659, dur: 0.16, type: "triangle", gain: 0.14, delay: 0.12 }); // E5
-    tone({ freq: 784, dur: 0.18, type: "triangle", gain: 0.15, delay: 0.24 }); // G5
-    tone({ freq: 1047, dur: 0.55, type: "sine", gain: 0.16, delay: 0.38 }); // C6
-    tone({ freq: 1568, dur: 0.5, type: "sine", gain: 0.07, delay: 0.44 }); // G6 sparkle
+    motif(THEME, { step: 0.12, dur: 0.17, type: "triangle", gain: 0.14 });
+    tone({ freq: THEME[0] * 2, dur: 0.55, type: "sine", gain: 0.16, delay: 0.38 }); // C6
+    tone({ freq: THEME[2] * 2, dur: 0.5, type: "sine", gain: 0.07, delay: 0.44 }); // G6 sparkle
   },
 };

@@ -3,12 +3,13 @@
 import { motion, useReducedMotion } from "framer-motion";
 import { SPRING, TAP } from "@/lib/motion";
 
-type ActionKey = "agent" | "gmail" | "github";
+type ActionKey = "agent" | "gmail" | "github" | "spotify";
 
 const ACTIONS: Array<{ key: ActionKey; label: string; icon: React.ReactNode }> = [
   { key: "agent", label: "Sepiol", icon: <SparkIcon /> },
   { key: "gmail", label: "Gmail", icon: <MailIcon /> },
   { key: "github", label: "GitHub", icon: <GitIcon /> },
+  { key: "spotify", label: "Spotify", icon: <MusicIcon /> },
 ];
 
 const ringMask =
@@ -200,6 +201,25 @@ function GitIcon() {
       <circle cx="17" cy="8" r="2.4" />
       <path d="M6 8.4v7.2" />
       <path d="M17 10.4a6 6 0 0 1-6 6H8.4" />
+    </svg>
+  );
+}
+function MusicIcon() {
+  return (
+    <svg
+      width="22"
+      height="22"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <circle cx="7" cy="18" r="2.6" />
+      <circle cx="17.5" cy="15.5" r="2.6" />
+      <path d="M9.6 18V6.5l10.5-2.6v11.6" />
     </svg>
   );
 }

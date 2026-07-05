@@ -4,17 +4,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AnimatePresence,
   motion,
+  useAnimationControls,
   useReducedMotion,
-  type Variants,
 } from "framer-motion";
 import styles from "./page.module.css";
 import AmbientVideo from "./components/AmbientVideo";
 import CodeStream from "./components/CodeStream";
 import LockScreen from "./components/LockScreen";
 import CinematicOverlay from "./components/CinematicOverlay";
+import HudChrome from "./components/HudChrome";
 import MediaGallery from "./components/MediaGallery";
 import Sidebar from "./components/Sidebar";
 import { sfx, unlock as unlockAudio, setMuted } from "@/lib/sound";
+import { startVitals, setVitalsStatus } from "@/lib/vitals";
 import { SPRING, TAP, DUR } from "@/lib/motion";
 
 /* ------------------------------------------------------------------ */
@@ -59,6 +61,24 @@ const STATUS_LABEL: Record<Status, string> = {
   thinking: "Thinking",
   speaking: "Speaking",
   error: "Error",
+};
+
+// Diegetic names for the corner telemetry — the accents were always HUD modes.
+const HUD_MODE: Record<Status, string> = {
+  idle: "STANDBY",
+  listening: "INTAKE",
+  thinking: "PROCESS",
+  speaking: "OUTPUT",
+  error: "FAULT",
+};
+
+// How deeply the orb breathes per state (consumed by .orb via --breath-amp).
+const BREATH_AMP: Record<Status, number> = {
+  idle: 0.04,
+  listening: 0.08,
+  thinking: 0.03,
+  speaking: 0.06,
+  error: 0.02,
 };
 
 /**
@@ -120,6 +140,42 @@ export default function Home() {
     document.addEventListener("visibilitychange", onVis);
     return () => document.removeEventListener("visibilitychange", onVis);
   }, []);
+
+  // The nervous system: one rAF loop writing --breath/--gaze/--pulse-period on
+  // :root. Runs regardless of lock state so the lock screen breathes too.
+  useEffect(() => startVitals(), []);
+  useEffect(() => {
+    setVitalsStatus(status);
+  }, [status]);
+
+  // Micro-expressions: one-shot gestures layered on a wrapper around the orb,
+  // separate from press feedback so the two never fight.
+  const exprCtrl = useAnimationControls();
+  const prevStatusRef = useRef<Status>("idle");
+  useEffect(() => {
+    const prev = prevStatusRef.current;
+    prevStatusRef.current = status;
+    if (reduceMotion) return;
+    if (prev === "listening" && status === "thinking") {
+      // Understood you — a quick nod.
+      void exprCtrl.start({
+        scaleY: [1, 0.87, 1.06, 1],
+        scaleX: [1, 1.05, 0.98, 1],
+        transition: { duration: 0.55, ease: "easeOut" },
+      });
+    } else if (status === "error" && prev !== "error") {
+      // Confused, not broken — a small head-tilt.
+      void exprCtrl.start({
+        rotate: [0, -7, 5, -2, 0],
+        transition: { duration: 0.7, ease: "easeInOut" },
+      });
+    }
+  }, [status, reduceMotion, exprCtrl]);
+
+  // Corner-telemetry numbers: time-to-first-byte and streamed length of the
+  // last reply, captured in sendMessage.
+  const [lastRtt, setLastRtt] = useState<number | null>(null);
+  const [lastChars, setLastChars] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -193,6 +249,12 @@ export default function Home() {
   const listeningRef = useRef(false);
   const messagesRef = useRef<ChatMessage[]>([]);
   const sendRef = useRef<(text: string) => void>(() => {});
+  // In-flight reply plumbing: abort the fetch on barge-in and use a generation
+  // counter so a stale stream can't keep writing the reply bubble or queueing
+  // speech after it's been interrupted.
+  const abortRef = useRef<AbortController | null>(null);
+  const genRef = useRef(0);
+  const pendingReplyRef = useRef(""); // text streamed so far, unfinalized
   const voiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const greetingRef = useRef("");
   const greetedRef = useRef(false);
@@ -270,6 +332,24 @@ export default function Home() {
     startTtsBeat();
   }, [startTtsBeat]);
 
+  /* ---- interrupt an in-flight reply ---- */
+  // Aborts the streaming fetch, invalidates its generation so late chunks and
+  // utterance callbacks become no-ops, and finalizes whatever was already
+  // streamed into history — so an interrupted answer isn't lost from context.
+  const interruptReply = useCallback(() => {
+    genRef.current++;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    const partial = pendingReplyRef.current.trim();
+    if (partial) {
+      messagesRef.current = [
+        ...messagesRef.current,
+        { role: "assistant", content: partial },
+      ];
+    }
+    pendingReplyRef.current = "";
+  }, []);
+
   /* ---- send to Claude ---- */
   const sendMessage = useCallback(
     async (text: string) => {
@@ -278,6 +358,12 @@ export default function Home() {
         setStatus("idle");
         return;
       }
+      // A new question supersedes any reply still streaming/speaking.
+      interruptReply();
+      const gen = ++genRef.current;
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+
       setError("");
       sfx.send();
       setStatus("thinking");
@@ -291,11 +377,13 @@ export default function Home() {
       ];
       messagesRef.current = history;
 
+      const t0 = performance.now();
       try {
         const res = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ messages: history }),
+          signal: ctrl.signal,
         });
         if (res.status === 401) {
           setUnlocked(false);
@@ -318,12 +406,14 @@ export default function Home() {
         let ended = 0;
         let streamDone = false;
         let everSpoke = false;
+        const stale = () => gen !== genRef.current;
         const maybeIdle = () => {
+          if (stale()) return;
           if (streamDone && ended >= queued) setStatus("idle");
         };
         const speakChunk = (txt: string) => {
           const t = txt.trim();
-          if (!synth || !t) return;
+          if (!synth || !t || stale()) return;
           const u = new SpeechSynthesisUtterance(t);
           if (voiceRef.current) u.voice = voiceRef.current;
           u.rate = 1.0;
@@ -373,10 +463,21 @@ export default function Home() {
         if (res.body) {
           const reader = res.body.getReader();
           const decoder = new TextDecoder();
+          let sawFirstByte = false;
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
+            if (stale()) {
+              // Interrupted: interruptReply() already finalized the partial.
+              reader.cancel().catch(() => {});
+              return;
+            }
+            if (!sawFirstByte) {
+              sawFirstByte = true;
+              setLastRtt(Math.round(performance.now() - t0));
+            }
             full += decoder.decode(value, { stream: true });
+            pendingReplyRef.current = full;
             setReply(full);
             drain();
           }
@@ -384,7 +485,10 @@ export default function Home() {
         } else {
           full = await res.text(); // no ReadableStream — read it whole
         }
+        if (stale()) return;
 
+        pendingReplyRef.current = "";
+        setLastChars(full.length);
         setReply(full);
         const restTail = full.slice(spoken).trim();
         if (restTail) speakChunk(restTail); // final partial sentence
@@ -398,12 +502,16 @@ export default function Home() {
         if (queued === 0) setStatus("idle");
         else maybeIdle();
       } catch (err) {
+        // An aborted fetch is a deliberate interruption, not a failure.
+        if (gen !== genRef.current || (err instanceof DOMException && err.name === "AbortError")) {
+          return;
+        }
         setError(err instanceof Error ? err.message : "Something went wrong.");
         sfx.error();
         setStatus("error");
       }
     },
-    [speak, startTtsBeat],
+    [interruptReply, startTtsBeat],
   );
 
   useEffect(() => {
@@ -563,8 +671,9 @@ export default function Home() {
       return;
     }
 
-    // Barge-in: stop any current speech.
+    // Barge-in: kill the in-flight reply stream AND any current speech.
     sfx.press();
+    interruptReply();
     haltSpeech();
 
     setError("");
@@ -579,7 +688,7 @@ export default function Home() {
       listeningRef.current = false;
       setStatus("idle");
     }
-  }, [speak]);
+  }, [speak, interruptReply]);
 
   const stopListening = useCallback(() => {
     if (!listeningRef.current) return;
@@ -587,9 +696,10 @@ export default function Home() {
   }, []);
 
   const stopSpeaking = useCallback(() => {
+    interruptReply();
     haltSpeech();
     setStatus("idle");
-  }, []);
+  }, [interruptReply]);
 
   /* ---- wake word: "hey Jarvis" → confirm → listen ---- */
   const onWake = useCallback(() => {
@@ -604,6 +714,13 @@ export default function Home() {
     unlockAudio();
     greetedRef.current = true; // skip the "first hold greets" path
     sfx.granted();
+    if (!reduceMotion) {
+      // Excited double-bob: the whole pendulum hops twice on its string.
+      void exprCtrl.start({
+        y: [0, -14, 0, -7, 0],
+        transition: { duration: 0.8, ease: "easeOut" },
+      });
+    }
     setError("");
     setReply("");
     setTranscript("");
@@ -611,7 +728,7 @@ export default function Home() {
       startListening(); // open the mic for the actual command
       handoffRef.current = false;
     });
-  }, [speak, startListening]);
+  }, [speak, startListening, exprCtrl, reduceMotion]);
 
   useEffect(() => {
     onWakeRef.current = onWake;
@@ -658,7 +775,7 @@ export default function Home() {
 
   // Right-sidebar quick actions → fire the matching tool through Jarvis.
   const handleQuickAction = useCallback(
-    (key: "agent" | "gmail" | "github") => {
+    (key: "agent" | "gmail" | "github" | "spotify") => {
       if (status === "thinking") return;
       const map = {
         agent: {
@@ -673,6 +790,11 @@ export default function Home() {
           label: "What's on GitHub?",
           prompt:
             "What pull requests need my review and what issues are assigned to me? Be brief.",
+        },
+        spotify: {
+          label: "What's playing?",
+          prompt:
+            "What's playing on Spotify right now? If nothing is, mention which devices are available. Keep it brief.",
         },
       }[key];
       unlockAudio();
@@ -721,31 +843,25 @@ export default function Home() {
   /* ---- render: main app ---- */
   const accent = ACCENT[status];
   const showRings = status === "listening" || status === "speaking";
-
-  const orbVariants: Variants = reduceMotion
-    ? { idle: {}, listening: {}, thinking: {}, speaking: {}, error: {} }
-    : {
-        idle: {
-          scale: [1, 1.04, 1],
-          transition: { duration: 4, repeat: Infinity, ease: "easeInOut" },
-        },
-        listening: {
-          scale: [1, 1.08, 1],
-          transition: { duration: 1.1, repeat: Infinity, ease: "easeInOut" },
-        },
-        thinking: { scale: 1 },
-        speaking: {
-          scale: [1, 1.06, 1],
-          transition: { duration: 0.7, repeat: Infinity, ease: "easeInOut" },
-        },
-        error: { scale: 1 },
-      };
+  // Orb breathing now rides the shared vitals sine (see .orb in the CSS) —
+  // the old per-status framer scale loops are replaced by --breath-amp.
 
   return (
     <main className={styles.shell}>
       <AmbientVideo />
       <CodeStream accent={accent} />
+      {/* Breath: the room's luminance inhales with the orb. */}
+      <div aria-hidden className={styles.breathGlow} style={{ color: accent }} />
       <CinematicOverlay />
+      <HudChrome
+        accent={accent}
+        mode={HUD_MODE[status]}
+        voiceName={voiceRef.current?.name ?? ""}
+        sttArmed={wakeOn}
+        rtt={lastRtt}
+        chars={lastChars}
+        paused={bgHidden}
+      />
       <Sidebar
         accent={accent}
         onAction={handleQuickAction}
@@ -804,6 +920,8 @@ export default function Home() {
       <section className={styles.stage}>
         <motion.div
           className={styles.pendulum}
+          // currentColor feeds the string's lub-dub glow (see .string CSS).
+          style={{ color: accent }}
           animate={reduceMotion || bgHidden ? { rotate: 0 } : { rotate: [-6, 6] }}
           transition={
             reduceMotion
@@ -867,7 +985,8 @@ export default function Home() {
             )}
           </AnimatePresence>
 
-          {/* the orb button */}
+          {/* the orb button, inside its expression layer (nod / tilt / bob) */}
+          <motion.div animate={exprCtrl} style={{ display: "grid", placeItems: "center" }}>
           <motion.button
             type="button"
             className={styles.orb}
@@ -876,9 +995,8 @@ export default function Home() {
             style={{
               background: "#000",
               boxShadow: "0 12px 34px -12px rgba(0,0,0,0.85)",
+              ["--breath-amp" as string]: BREATH_AMP[status],
             }}
-            variants={orbVariants}
-            animate={status}
             whileTap={{ scale: TAP }}
             onPointerDown={(e) => {
               e.preventDefault();
@@ -902,6 +1020,7 @@ export default function Home() {
           >
             <MicIcon className={styles.orbIcon} />
           </motion.button>
+          </motion.div>
           </div>
         </motion.div>
 

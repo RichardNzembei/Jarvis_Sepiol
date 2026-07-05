@@ -116,6 +116,9 @@ export default function CodeStream({ accent }: { accent: string }) {
         display: "flex",
         justifyContent: "space-around",
         gap: "3vw",
+        // Presence: nearer layer parallaxes a touch more than the video.
+        translate:
+          "calc(var(--gaze-x, 0) * -11px) calc(var(--gaze-y, 0) * -7px)",
         maskImage:
           "radial-gradient(ellipse 62% 58% at 50% 42%, transparent 34%, #000 78%)",
         WebkitMaskImage:

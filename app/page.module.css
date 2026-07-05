@@ -92,6 +92,10 @@
   flex-direction: column;
   align-items: center;
   transform-origin: top center;
+  /* Presence: lean a hair toward the pointer. The independent CSS `rotate`
+     property composes with framer-motion's transform swing instead of
+     fighting it. --gaze-x is written by lib/vitals.ts. */
+  rotate: calc(var(--gaze-x, 0) * 1.2deg);
 }
 
 .mount {
@@ -113,6 +117,40 @@
     rgba(148, 163, 184, 0.25)
   );
   box-shadow: 0 0 6px rgba(148, 163, 184, 0.25);
+  /* Pulse: a faint lub-dub travelling glow. Rate (--pulse-period) is set by
+     lib/vitals.ts from assistant state; color comes from the accent via the
+     pendulum's currentColor. Subliminal by design. */
+  animation: lubDub var(--pulse-period, 1.15s) ease-in-out infinite;
+}
+
+@keyframes lubDub {
+  0%,
+  26%,
+  100% {
+    box-shadow: 0 0 6px rgba(148, 163, 184, 0.25);
+    filter: brightness(1);
+  }
+  6% {
+    box-shadow: 0 0 9px 0.5px currentColor;
+    filter: brightness(1.55);
+  }
+  13% {
+    box-shadow: 0 0 6px rgba(148, 163, 184, 0.28);
+    filter: brightness(1.05);
+  }
+  19% {
+    box-shadow: 0 0 8px 0.5px currentColor;
+    filter: brightness(1.35);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .string {
+    animation: none;
+  }
+  .pendulum {
+    rotate: 0deg;
+  }
 }
 
 .orbWrap {
@@ -169,6 +207,11 @@
   place-items: center;
   color: #fff;
   outline: none;
+  /* Breath: the orb inhales with the room. --breath is the shared sine from
+     lib/vitals.ts (already 0 under reduced motion); --breath-amp is set
+     inline per assistant state. Independent `scale` composes with framer's
+     whileTap transform. */
+  scale: calc(1 + var(--breath, 0) * var(--breath-amp, 0.04));
 }
 
 .orb:focus-visible {
@@ -423,4 +466,56 @@
     width: 132px;
     height: 132px;
   }
+}
+
+/* ---- vitals consumers (see lib/vitals.ts) ---- */
+
+/* Breath: the room's luminance rises and falls with the shared sine. Sits
+   between CodeStream (-2) and CinematicOverlay (-1) in the background stack. */
+.breathGlow {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 60% 45% at 50% 42%,
+    currentColor,
+    transparent 70%
+  );
+  opacity: calc(0.04 + var(--breath, 0) * 0.06);
+}
+
+/* ---- diegetic corner telemetry (HudChrome) ---- */
+.hud {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  pointer-events: none;
+  display: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  line-height: 1.7;
+  text-transform: uppercase;
+  opacity: 0.45;
+}
+
+/* Corners are only free once the 720px column has real margin around it. */
+@media (min-width: 920px) {
+  .hud {
+    display: block;
+  }
+}
+
+.hudCorner {
+  position: absolute;
+  padding: 4px 8px;
+}
+
+.hudBracket {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-color: currentColor;
+  opacity: 0.8;
 }

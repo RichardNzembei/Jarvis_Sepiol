@@ -44,6 +44,10 @@ export default function AmbientVideo() {
         zIndex: -4,
         overflow: "hidden",
         pointerEvents: "none",
+        // Presence: deepest layer drifts opposite the gaze, slowest of the
+        // stack. The video's 1.04 scale leaves margin so edges never show.
+        translate:
+          "calc(var(--gaze-x, 0) * -6px) calc(var(--gaze-y, 0) * -4px)",
       }}
     >
       <video
