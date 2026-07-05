@@ -103,6 +103,9 @@ export default function LockScreen({ onUnlock }: { onUnlock: () => void }) {
       } else if (res.status === 401) {
         setError("Access denied.");
         setKey("");
+      } else if (res.status === 429) {
+        setError("Too many attempts. Try again in a few minutes.");
+        setKey("");
       } else {
         setError("Authentication isn't available right now.");
       }
