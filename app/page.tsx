@@ -146,6 +146,7 @@ export default function Home() {
   useEffect(() => startVitals(), []);
   useEffect(() => {
     setVitalsStatus(status);
+    statusRef.current = status;
   }, [status]);
 
   // Micro-expressions: one-shot gestures layered on a wrapper around the orb,
@@ -202,10 +203,13 @@ export default function Home() {
 
   // Time-aware greeting for Sepiol + pick the most JARVIS-like (British) voice.
   useEffect(() => {
+    if (supported === null) return; // wait for STT detection — greeting differs
     const h = new Date().getHours();
     const part =
       h < 12 ? "Good morning" : h < 18 ? "Good afternoon" : "Good evening";
-    const g = `${part}, Sepiol. All systems are online. Hold the orb whenever you'd like to speak.`;
+    const g = supported
+      ? `${part}, Sepiol. All systems are online. Hold the orb whenever you'd like to speak.`
+      : `${part}, Sepiol. All systems are online. Voice input isn't available in this browser — type below whenever you need me.`;
     greetingRef.current = g;
     setGreeting(g);
 
@@ -233,7 +237,7 @@ export default function Home() {
     pickVoice();
     synth.addEventListener?.("voiceschanged", pickVoice);
     return () => synth.removeEventListener?.("voiceschanged", pickVoice);
-  }, []);
+  }, [supported]);
 
   const toggleMute = useCallback(() => {
     setMutedState((prev) => {
@@ -269,6 +273,20 @@ export default function Home() {
   const handoffRef = useRef(false); // mid wake→command handoff (suppresses re-arm)
   const wakeFailsRef = useRef(0); // consecutive STT network failures
   const onWakeRef = useRef<() => void>(() => {});
+  // Deferred on-device language-pack install — install() demands a user
+  // gesture, so the detection effect parks it here and gesture handlers fire it.
+  const installLocalSttRef = useRef<(() => void) | null>(null);
+
+  // Conversational-flow plumbing:
+  const statusRef = useRef<Status>("idle"); // live status for recognizer handlers
+  const lastVoiceRef = useRef(false); // was the last exchange voice-initiated?
+  const replyDoneRef = useRef(false); // reply finished NATURALLY (not interrupted)
+  const speakingNowRef = useRef(""); // text of the utterance currently playing
+  const onVoiceStopRef = useRef<(word: string) => void>(() => {});
+  const ackIdxRef = useRef(0); // rotates the "thank you" acknowledgements
+  // Soft listening = the auto-reopened follow-up mic: reply stays visible,
+  // quieter chime, single dim ring.
+  const [softListen, setSoftListen] = useState(false);
 
   // Chrome reliability: it pauses long/queued speech (~15s bug) and sometimes
   // never starts a queued utterance after cancel(). A periodic resume() keeps
@@ -316,6 +334,9 @@ export default function Home() {
       if (voiceRef.current) u.voice = voiceRef.current;
       u.rate = 1.0;
       u.pitch = 0.92; // a touch lower — measured, JARVIS-like
+      u.onstart = () => {
+        speakingNowRef.current = chunk; // lets the stop-word filter spot self-echo
+      };
       if (i === chunks.length - 1) {
         u.onend = () => {
           setStatus("idle");
@@ -338,6 +359,7 @@ export default function Home() {
   // streamed into history — so an interrupted answer isn't lost from context.
   const interruptReply = useCallback(() => {
     genRef.current++;
+    replyDoneRef.current = false; // an interrupted reply never opens a follow-up
     abortRef.current?.abort();
     abortRef.current = null;
     const partial = pendingReplyRef.current.trim();
@@ -358,6 +380,35 @@ export default function Home() {
         setStatus("idle");
         return;
       }
+
+      // Conversation closer: "thank you, Jarvis" / "that's all" ends the
+      // exchange locally — a rotating spoken acknowledgement, no API call,
+      // and deliberately NO follow-up listen (the user just said goodbye).
+      if (
+        /^(?:thank(?:s| you)|that(?:['’]s| is) all|good ?night)[\s,]*(?:jarvis)?\s*[.!?]*$/i.test(
+          trimmed,
+        )
+      ) {
+        interruptReply();
+        const acks = [
+          "Very good, Sepiol.",
+          "Always, Sepiol.",
+          "Of course, Sepiol.",
+          "Anytime, Sepiol.",
+        ];
+        const ack = acks[ackIdxRef.current++ % acks.length];
+        messagesRef.current = [
+          ...messagesRef.current,
+          { role: "user", content: trimmed },
+          { role: "assistant", content: ack },
+        ];
+        setError("");
+        setReply(ack);
+        sfx.reply();
+        speak(ack);
+        return;
+      }
+
       // A new question supersedes any reply still streaming/speaking.
       interruptReply();
       const gen = ++genRef.current;
@@ -409,7 +460,10 @@ export default function Home() {
         const stale = () => gen !== genRef.current;
         const maybeIdle = () => {
           if (stale()) return;
-          if (streamDone && ended >= queued) setStatus("idle");
+          if (streamDone && ended >= queued) {
+            replyDoneRef.current = true; // natural finish — follow-up may open
+            setStatus("idle");
+          }
         };
         const speakChunk = (txt: string) => {
           const t = txt.trim();
@@ -418,6 +472,9 @@ export default function Home() {
           if (voiceRef.current) u.voice = voiceRef.current;
           u.rate = 1.0;
           u.pitch = 0.92;
+          u.onstart = () => {
+            speakingNowRef.current = t; // lets the stop-word filter spot self-echo
+          };
           u.onend = () => {
             ended++;
             maybeIdle();
@@ -511,7 +568,7 @@ export default function Home() {
         setStatus("error");
       }
     },
-    [interruptReply, startTtsBeat],
+    [interruptReply, startTtsBeat, speak],
   );
 
   useEffect(() => {
@@ -556,6 +613,12 @@ export default function Home() {
 
     recognition.onerror = (e) => {
       if (e.error === "no-speech" || e.error === "aborted") return;
+      if (e.error === "language-not-supported") {
+        // The on-device pack vanished after we opted in — fall back to cloud.
+        (recognition as { processLocally?: boolean }).processLocally = false;
+        setStatus((s) => (s === "listening" ? "idle" : s));
+        return;
+      }
       let message: string;
       switch (e.error) {
         case "not-allowed":
@@ -577,8 +640,10 @@ export default function Home() {
     recognition.onend = () => {
       listeningRef.current = false;
       const text = finalTranscriptRef.current.trim();
-      if (text) sendRef.current(text);
-      else setStatus((s) => (s === "listening" ? "idle" : s));
+      if (text) {
+        lastVoiceRef.current = true; // voice-initiated → eligible for follow-up
+        sendRef.current(text);
+      } else setStatus((s) => (s === "listening" ? "idle" : s));
     };
 
     recognitionRef.current = recognition;
@@ -588,6 +653,49 @@ export default function Home() {
     wake.continuous = true;
     wake.interimResults = true;
     wake.lang = "en-US";
+
+    // Chrome 139+ can run recognition fully ON-DEVICE: audio never leaves the
+    // machine and the network-error class disappears (this matters most for
+    // the wake recognizer, which otherwise streams the room to Google while
+    // armed). Feature-detect and opt in; if the language pack is missing,
+    // start a download so a future session gets it. "language-not-supported"
+    // at start() time falls back to cloud — see the onerror handlers.
+    type LocalCapable = { processLocally?: boolean };
+    const SRStatic = SRClass as unknown as {
+      available?: (opts: { langs: string[]; processLocally: boolean }) => Promise<string>;
+      install?: (opts: { langs: string[]; processLocally: boolean }) => Promise<boolean>;
+    };
+    SRStatic.available?.({ langs: ["en-US"], processLocally: true })
+      .then((avail) => {
+        if (avail === "available") {
+          (recognition as LocalCapable).processLocally = true;
+          (wake as LocalCapable).processLocally = true;
+        } else if (avail === "downloadable") {
+          // install() throws NotAllowedError outside a user gesture — park it
+          // for the first orb hold / wake toggle to trigger. The throw can be
+          // SYNCHRONOUS (e.g. a synthetic click without real activation), so
+          // only consume the one-shot once the call actually went through.
+          installLocalSttRef.current = () => {
+            try {
+              const p = SRStatic.install?.({ langs: ["en-US"], processLocally: true });
+              installLocalSttRef.current = null; // reached only if the call took
+              p?.then((ok) => {
+                if (ok) {
+                  (recognition as LocalCapable).processLocally = true;
+                  (wake as LocalCapable).processLocally = true;
+                }
+              }).catch(() => {
+                /* stay on cloud recognition */
+              });
+            } catch {
+              /* no user activation — stay parked for a real gesture */
+            }
+          };
+        }
+      })
+      .catch(() => {
+        /* older browser — cloud recognition as before */
+      });
 
     const matchesWake = (raw: string) => {
       const t = raw.toLowerCase().replace(/[^a-z\s]/g, " ");
@@ -600,12 +708,38 @@ export default function Home() {
 
     wake.onresult = (e) => {
       wakeFailsRef.current = 0; // service is reachable
+      // Match only the freshest results (plus one prior, in case the phrase
+      // split across two results). Scanning the session's ACCUMULATED
+      // transcript let "hey" from minute one pair with "jarvis" from minute
+      // four — false wakes that got likelier the longer the session ran.
+      const from = Math.max(0, e.resultIndex - 1);
       let heard = "";
-      for (let i = 0; i < e.results.length; i++) heard += e.results[i][0].transcript + " ";
+      for (let i = from; i < e.results.length; i++) heard += e.results[i][0].transcript + " ";
+
+      // While JARVIS speaks, the recognizer runs in STOP-WORD-ONLY mode: no
+      // wake matching (his own reply must never wake him). A stop word counts
+      // only if (a) the utterance is short — room chatter has more words —
+      // and (b) the word isn't in the sentence currently being spoken (self-
+      // echo through the mic).
+      if (statusRef.current === "speaking") {
+        const t = heard.toLowerCase().replace(/[^a-z\s']/g, " ");
+        const m = /\b(stop|never ?mind|cancel|enough|quiet|wait)\b/.exec(t);
+        if (m) {
+          const words = t.trim().split(/\s+/).filter(Boolean).length;
+          const selfEcho = speakingNowRef.current.toLowerCase().includes(m[1]);
+          if (words <= 4 && !selfEcho) onVoiceStopRef.current(m[1]);
+        }
+        return;
+      }
+
       if (matchesWake(heard)) onWakeRef.current();
     };
 
     wake.onerror = (e) => {
+      if (e.error === "language-not-supported") {
+        (wake as { processLocally?: boolean }).processLocally = false;
+        return; // onend restarts on the cloud path
+      }
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
         wakeOnRef.current = false;
         wakeShouldRunRef.current = false;
@@ -628,8 +762,12 @@ export default function Home() {
     };
 
     wake.onend = () => {
-      // Continuous recognition still stops periodically; keep it alive while armed.
+      // Continuous recognition still stops periodically; keep it alive while
+      // armed. Restart delay backs off exponentially with consecutive network
+      // failures (350ms → 8s) so one Wi-Fi blip can't burn all six strikes in
+      // two seconds and silently kill the feature.
       if (wakeShouldRunRef.current) {
+        const delay = Math.min(350 * 2 ** wakeFailsRef.current, 8000);
         setTimeout(() => {
           if (wakeShouldRunRef.current) {
             try {
@@ -638,7 +776,7 @@ export default function Home() {
               /* already running */
             }
           }
-        }, 350);
+        }, delay);
       }
     };
 
@@ -656,12 +794,16 @@ export default function Home() {
   }, []);
 
   /* ---- push-to-talk controls ---- */
-  const startListening = useCallback(() => {
+  // opts.soft = follow-up relisten: the reply stays on screen, the chime is a
+  // whisper, and the rings render dim/single — "I'm still here", not INTAKE.
+  const startListening = useCallback((opts?: { soft?: boolean }) => {
     const recognition = recognitionRef.current;
     if (!recognition || listeningRef.current) return;
 
-    // Unlock audio within this gesture (browsers require it).
+    // Unlock audio within this gesture (browsers require it), and use the same
+    // gesture to kick off the on-device speech pack download if one is pending.
     unlockAudio();
+    installLocalSttRef.current?.();
 
     // First hold wakes JARVIS: boot sound + spoken greeting, no listening yet.
     if (!greetedRef.current) {
@@ -672,12 +814,26 @@ export default function Home() {
     }
 
     // Barge-in: kill the in-flight reply stream AND any current speech.
-    sfx.press();
+    if (opts?.soft) sfx.attend();
+    else sfx.press();
     interruptReply();
     haltSpeech();
 
-    setError("");
-    setReply("");
+    // Chrome allows ONE recognition session per page. The status effect stops
+    // the armed wake recognizer only AFTER the re-render, so stop it here,
+    // before command.start() — otherwise the press can silently eat itself.
+    wakeShouldRunRef.current = false;
+    try {
+      wakeRecRef.current?.stop();
+    } catch {
+      /* ignore */
+    }
+
+    if (!opts?.soft) {
+      setError("");
+      setReply(""); // soft mode keeps the answer on screen while you follow up
+    }
+    setSoftListen(!!opts?.soft);
     setTranscript("");
     finalTranscriptRef.current = "";
     listeningRef.current = true;
@@ -685,8 +841,16 @@ export default function Home() {
     try {
       recognition.start();
     } catch {
-      listeningRef.current = false;
-      setStatus("idle");
+      // The wake session may not have released the mic yet — retry once.
+      window.setTimeout(() => {
+        if (!listeningRef.current) return; // released/aborted meanwhile
+        try {
+          recognition.start();
+        } catch {
+          listeningRef.current = false;
+          setStatus("idle");
+        }
+      }, 150);
     }
   }, [speak, interruptReply]);
 
@@ -700,6 +864,43 @@ export default function Home() {
     haltSpeech();
     setStatus("idle");
   }, [interruptReply]);
+
+  // Voice interrupt while JARVIS speaks: "stop/cancel/enough" halts him;
+  // "wait" halts AND softly reopens the mic — the partial reply was already
+  // finalized into history by interruptReply, so "actually, make it Tuesday"
+  // lands with coherent context.
+  const onVoiceStop = useCallback(
+    (word: string) => {
+      stopSpeaking();
+      if (word === "wait") {
+        window.setTimeout(() => {
+          if (statusRef.current === "idle") startListening({ soft: true });
+        }, 350);
+      }
+    },
+    [stopSpeaking, startListening],
+  );
+  useEffect(() => {
+    onVoiceStopRef.current = onVoiceStop;
+  }, [onVoiceStop]);
+
+  // Follow-up mode: after a voice-initiated reply finishes NATURALLY and the
+  // wake word is armed (the user has opted into hands-free), softly reopen
+  // the mic — no orb hold, no re-wake. Chrome's own no-speech timeout closes
+  // the window silently if nothing comes.
+  const followPrevRef = useRef<Status>("idle");
+  useEffect(() => {
+    const prev = followPrevRef.current;
+    followPrevRef.current = status;
+    if (prev !== "speaking" || status !== "idle") return;
+    if (!replyDoneRef.current) return;
+    replyDoneRef.current = false;
+    if (!wakeOnRef.current || !lastVoiceRef.current) return;
+    const t = window.setTimeout(() => {
+      if (statusRef.current === "idle") startListening({ soft: true });
+    }, 450);
+    return () => window.clearTimeout(t);
+  }, [status, startListening]);
 
   /* ---- wake word: "hey Jarvis" → confirm → listen ---- */
   const onWake = useCallback(() => {
@@ -724,10 +925,19 @@ export default function Home() {
     setError("");
     setReply("");
     setTranscript("");
-    speak("Sepiol, under your command.", () => {
+    // The confirmation's completion callback is the ONLY thing that clears
+    // handoffRef — and speech callbacks are exactly what this app has seen
+    // wedge. A 4s safety timeout guarantees the handoff always completes;
+    // whichever path fires first wins.
+    let finished = false;
+    const finishHandoff = () => {
+      if (finished) return;
+      finished = true;
       startListening(); // open the mic for the actual command
       handoffRef.current = false;
-    });
+    };
+    speak("Sepiol, under your command.", finishHandoff);
+    window.setTimeout(finishHandoff, 4000);
   }, [speak, startListening, exprCtrl, reduceMotion]);
 
   useEffect(() => {
@@ -737,7 +947,10 @@ export default function Home() {
   const toggleWake = useCallback(() => {
     if (!recognitionRef.current) return; // STT unsupported
     unlockAudio(); // this click is the gesture that lets the mic + audio work
+    installLocalSttRef.current?.(); // gesture also permits the pack download
     wakeFailsRef.current = 0;
+    // Recovery lever: a wedged handoff must not survive a disarm/re-arm.
+    handoffRef.current = false;
     setWakeOn((prev) => {
       const next = !prev;
       wakeOnRef.current = next;
@@ -745,12 +958,19 @@ export default function Home() {
     });
   }, []);
 
-  // Run the wake recognizer ONLY while armed and idle — never during a command
-  // or while JARVIS is speaking (or it would transcribe his own voice).
+  // Run the wake recognizer while armed, visible, and either idle (wake-phrase
+  // mode) or SPEAKING (stop-word-only mode — see wake.onresult; wake matching
+  // is disabled there so his own voice can't wake him). Never during a command
+  // capture, and never in a hidden tab (an unattended mic streaming all night
+  // is a battery and privacy cost with nobody in front of the machine).
   useEffect(() => {
     const wake = wakeRecRef.current;
     if (!wake) return;
-    const shouldRun = wakeOn && status === "idle" && !handoffRef.current;
+    const shouldRun =
+      wakeOn &&
+      (status === "idle" || status === "speaking") &&
+      !handoffRef.current &&
+      !bgHidden;
     wakeShouldRunRef.current = shouldRun;
     try {
       if (shouldRun) wake.start();
@@ -758,7 +978,7 @@ export default function Home() {
     } catch {
       /* start() throws if already running; stop() if already stopped */
     }
-  }, [wakeOn, status]);
+  }, [wakeOn, status, bgHidden]);
 
   // Typed fallback — works on any browser/network when voice STT is unavailable.
   const submitTyped = (e: React.FormEvent) => {
@@ -766,6 +986,7 @@ export default function Home() {
     const text = typed.trim();
     if (!text || status === "thinking") return;
     unlockAudio(); // gesture → lets sfx play
+    lastVoiceRef.current = false; // typed exchanges don't auto-reopen the mic
     setError("");
     setReply("");
     setTranscript(text);
@@ -798,6 +1019,7 @@ export default function Home() {
         },
       }[key];
       unlockAudio();
+      lastVoiceRef.current = false; // clicked, not spoken — no follow-up mic
       setError("");
       setReply("");
       setTranscript(map.label);
@@ -808,31 +1030,9 @@ export default function Home() {
 
   /* ---- render: detecting ---- */
   if (supported === null) return <main className={styles.shell} />;
-
-  /* ---- render: unsupported browser ---- */
-  if (supported === false) {
-    return (
-      <main className={styles.fallback}>
-        <motion.div
-          className={styles.fallbackCard}
-          initial={{ opacity: 0, y: 12 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.4 }}
-        >
-          <h1>Voice isn&apos;t supported here</h1>
-          <p>
-            Jarvis uses your browser&apos;s built-in speech recognition, which
-            this browser doesn&apos;t provide. Please open it in one of these:
-          </p>
-          <div className={styles.fallbackBadges}>
-            <span>Chrome</span>
-            <span>Edge</span>
-            <span>Safari</span>
-          </div>
-        </motion.div>
-      </main>
-    );
-  }
+  // NOTE: supported === false no longer dead-ends the app. Typed input + TTS
+  // work everywhere (including iOS Safari, whose STT is quirky rather than
+  // absent); only the orb and wake toggle are voice-gated below.
 
   /* ---- render: checking the session (avoids any unlocked/lock flash) ---- */
   if (unlocked === null) return <main className={styles.shell} />;
@@ -884,27 +1084,29 @@ export default function Home() {
           >
             {STATUS_LABEL[status]}
           </motion.div>
-          <button
-            type="button"
-            className={styles.iconBtn}
-            onClick={toggleWake}
-            aria-label={
-              wakeOn ? 'Disarm wake word' : 'Arm wake word — say "hey Jarvis"'
-            }
-            aria-pressed={wakeOn}
-            title={
-              wakeOn
-                ? 'Listening for "hey Jarvis" — click to disarm'
-                : 'Arm "hey Jarvis" wake word (mic stays on)'
-            }
-            style={
-              wakeOn
-                ? { color: accent, borderColor: accent, boxShadow: `0 0 0 1px ${accent}55` }
-                : undefined
-            }
-          >
-            <WakeIcon active={wakeOn} />
-          </button>
+          {supported && (
+            <button
+              type="button"
+              className={styles.iconBtn}
+              onClick={toggleWake}
+              aria-label={
+                wakeOn ? 'Disarm wake word' : 'Arm wake word — say "hey Jarvis"'
+              }
+              aria-pressed={wakeOn}
+              title={
+                wakeOn
+                  ? 'Listening for "hey Jarvis" — click to disarm'
+                  : 'Arm "hey Jarvis" wake word (mic stays on)'
+              }
+              style={
+                wakeOn
+                  ? { color: accent, borderColor: accent, boxShadow: `0 0 0 1px ${accent}55` }
+                  : undefined
+              }
+            >
+              <WakeIcon active={wakeOn} />
+            </button>
+          )}
           <button
             type="button"
             className={styles.iconBtn}
@@ -941,25 +1143,41 @@ export default function Home() {
             style={{ color: accent }}
             role="presentation"
           >
-          {/* expanding rings while listening / speaking */}
+          {/* rings: INTAKE converges inward (sound travels TOWARD Jarvis —
+              born far and faint, absorbed by the orb), OUTPUT emanates.
+              Soft listening (follow-up mic) shows a single dim ring. */}
           {!reduceMotion && (
             <AnimatePresence>
               {showRings &&
-                [0, 0.5, 1].map((delay) => (
-                  <motion.span
-                    key={delay}
-                    className={styles.ring}
-                    initial={{ scale: 0.62, opacity: 0.7 }}
-                    animate={{ scale: 1.7, opacity: 0 }}
-                    exit={{ opacity: 0, transition: { duration: 0.3 } }}
-                    transition={{
-                      duration: 1.8,
-                      repeat: Infinity,
-                      delay,
-                      ease: "easeOut",
-                    }}
-                  />
-                ))}
+                (status === "listening" && softListen ? [0] : [0, 0.5, 1]).map(
+                  (delay) => {
+                    const inward = status === "listening";
+                    return (
+                      <motion.span
+                        key={`${inward}-${softListen}-${delay}`}
+                        className={styles.ring}
+                        style={inward ? { borderWidth: 1.5 } : undefined}
+                        initial={
+                          inward
+                            ? { scale: 1.9, opacity: 0 }
+                            : { scale: 0.62, opacity: 0.7 }
+                        }
+                        animate={
+                          inward
+                            ? { scale: 0.66, opacity: softListen ? 0.35 : 0.7 }
+                            : { scale: 1.7, opacity: 0 }
+                        }
+                        exit={{ opacity: 0, transition: { duration: 0.3 } }}
+                        transition={{
+                          duration: 1.8,
+                          repeat: Infinity,
+                          delay,
+                          ease: inward ? "easeIn" : "easeOut",
+                        }}
+                      />
+                    );
+                  },
+                )}
             </AnimatePresence>
           )}
 
@@ -990,11 +1208,20 @@ export default function Home() {
           <motion.button
             type="button"
             className={styles.orb}
-            aria-label="Press and hold to talk"
+            disabled={!supported}
+            aria-label={
+              supported
+                ? "Press and hold to talk"
+                : "Voice input isn't available in this browser — type below"
+            }
+            title={
+              supported ? undefined : "Voice input unavailable — type below"
+            }
             aria-pressed={status === "listening"}
             style={{
               background: "#000",
               boxShadow: "0 12px 34px -12px rgba(0,0,0,0.85)",
+              opacity: supported ? 1 : 0.55,
               ["--breath-amp" as string]: BREATH_AMP[status],
             }}
             whileTap={{ scale: TAP }}

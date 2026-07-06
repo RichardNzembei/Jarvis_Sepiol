@@ -110,6 +110,10 @@ export const sfx = {
   swoosh() {
     tone({ freq: 1200, to: 480, dur: 0.18, type: "triangle", gain: 0.1 });
   },
+  /** follow-up mic reopening — the motif's first note alone, barely there */
+  attend() {
+    tone({ freq: THEME[0], dur: 0.12, type: "sine", gain: 0.06 });
+  },
   /** error — the motif inverted into minor and dropped low, falling away */
   error() {
     motif(THEME_MINOR_DOWN, { step: 0.11, dur: 0.2, type: "square", gain: 0.11 });
